@@ -4,25 +4,19 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"log"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	_ "embed"
 
 	_ "github.com/go-sql-driver/mysql"
 )
-
-//go:embed random_names.csv
-var nameList string
-
-//go:embed insert_random_names.sql
-var insertNamesCmp string
 
 var key = []byte("qhmQvFgKBJGaaRADCUmLMMb0lVtm6fLq")
 
@@ -30,6 +24,17 @@ func createHmac(plain string) byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(plain))
 	return mac.Sum(nil)[0]
+}
+
+func combineHmacs(letters1 byte, letters2 byte, letters3 byte, letters4 byte, letters5 byte) uint32 {
+	return uint32(
+		((uint32(letters1)&0x1f)<<0)|
+			((uint32(letters2)&0x1f)<<5)|
+			((uint32(letters3)&0x1f)<<10)|
+			((uint32(letters4)&0x1f)<<15)|
+			((uint32(letters5)&0x1f)<<20),
+	) & 0xffffff
+	// ((int32(letters5) & 0x3f) << 24))
 }
 
 type SearchResult struct {
@@ -40,52 +45,111 @@ type SearchResult struct {
 	matchWordLen          int
 }
 
+type UserName struct {
+	FirstName string `json:"first"`
+	LastName  string `json:"last"`
+}
+type User struct {
+	Name UserName `json:"name"`
+}
+type GetUsersResponse struct {
+	Error   string `json:"error"`
+	Results []User `json:"results"`
+}
+
+var lastRequest = time.Time{}
+
+var lck = sync.Mutex{}
+
+const throttleRandomUsersSeconds = 20
+
+func getRandomUsers(amount int, nationality string) ([]User, error) {
+	lck.Lock()
+	defer lck.Unlock()
+	sinceLast := time.Since(lastRequest)
+	fmt.Printf("last requested users %d ago at %s\n", sinceLast, lastRequest.Format("3:04:05PM"))
+	if sinceLast <= (throttleRandomUsersSeconds * time.Second) {
+		fmt.Printf("Waiting %d seconds to make api request to respect their limits\n", (throttleRandomUsersSeconds*time.Second-sinceLast)/time.Second)
+		<-time.After(throttleRandomUsersSeconds*time.Second - sinceLast)
+	}
+	for {
+		lastRequest = time.Now()
+		res, err := http.Get(fmt.Sprintf("https://randomuser.me/api?results=%d&nat=%s&inc=name&noinfo", amount, nationality))
+		if err != nil {
+			return nil, err
+		}
+		defer res.Body.Close()
+		decoder := json.NewDecoder(res.Body)
+		usersResponse := GetUsersResponse{Results: []User{}}
+		err = decoder.Decode(&usersResponse)
+		if err != nil {
+			return nil, err
+		}
+		if usersResponse.Error == "" {
+			return usersResponse.Results, nil
+		}
+		fmt.Printf("Error while getting random users: %q. Retrying...\n", usersResponse.Error)
+		<-time.After(120 * time.Second)
+	}
+}
+
 func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	switch len(search) {
 	case 1:
-		hmac1 := createHmac(search[:1])
+		hmac := combineHmacs(createHmac(search[:1]), 0, 0, 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx1 = ? 
-			or last_name_bidx1 = ?
-			LIMIT 1000;`,
-			hmac1,
-			hmac1,
+			first_name_bidx & X'1F' = ? 
+			or last_name_bidx & X'1F' = ?
+		--	LIMIT 1000
+			;`,
+			hmac,
+			hmac,
 		)
 	case 2:
-		hmac1 := createHmac(search[:1])
-		hmac2 := createHmac(search[:2])
+		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), 0, 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			(first_name_bidx1 = ? and first_name_bidx2 = ?) 
-			or (last_name_bidx1 = ? and last_name_bidx2 = ?)
-			LIMIT 1000;`,
-			hmac1, hmac2,
-			hmac1, hmac2,
+			first_name_bidx & X'03FF' = ? 
+			or last_name_bidx & X'03FF' = ?
+		--	LIMIT 1000;`,
+			hmac,
+			hmac,
 		)
 	case 3:
-		searchPadded := search
-		hmac1 := createHmac(search[:1])
-		hmac2 := createHmac(searchPadded[:2])
-		hmac3 := createHmac(searchPadded[:3])
+		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			(first_name_bidx1 = ? and first_name_bidx2 = ? and first_name_bidx3 = ?)  
-			or (last_name_bidx1 = ? and last_name_bidx2 = ? and last_name_bidx3 = ?)
-			LIMIT 1000;`,
-			hmac1, hmac2, hmac3,
-			hmac1, hmac2, hmac3,
+			first_name_bidx & X'7FFF' = ?
+			or last_name_bidx & X'7FFF' = ?
+			-- LIMIT 1000;`,
+			hmac,
+			hmac,
+		)
+	case 4:
+		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), 0)
+		return db.Query(`select first_name, last_name from patients where 
+			first_name_bidx & X'01FFFF' = ? 
+			or last_name_bidx & X'01FFFF' = ?
+			-- LIMIT 1000;`,
+			hmac,
+			hmac,
 		)
 	default:
-		searchPadded := search
-		hmac1 := createHmac(search[:1])
-		hmac2 := createHmac(searchPadded[:2])
-		hmac3 := createHmac(searchPadded[:3])
-		hmac4 := createHmac(searchPadded[:4])
+		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), createHmac(search[:5]))
 		return db.Query(`select first_name, last_name from patients where 
-			(first_name_bidx1 = ? and  first_name_bidx2 = ? and first_name_bidx3 = ? and first_name_bidx4 = ?) 
-			or (last_name_bidx1 = ? and last_name_bidx2 = ? and last_name_bidx3 = ? and last_name_bidx4 = ?)
-			LIMIT 1000;`,
-			hmac1, hmac2, hmac3, hmac4,
-			hmac1, hmac2, hmac3, hmac4,
+			first_name_bidx & X'3FFFFF' = ? 
+			or last_name_bidx & X'3FFFFF' = ?
+			-- LIMIT 1000;`,
+			hmac,
+			hmac,
 		)
+		// default:
+		// 	hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), createHmac(search[:5]))
+		// 	return db.Query(`select first_name, last_name from patients where
+		// 		first_name_bidx & 0x3fffffff = ?
+		// 		or last_name_bidx & 0x3fffffff = ?
+		// 		LIMIT 1000;`,
+		// 		hmac,
+		// 		hmac,
+		// 	)
 		// default:
 		// 	searchPadded := search + "       "
 		// 	hmac1 := createHmac(search[:1])
@@ -262,146 +326,112 @@ OR table_name = 'patients_comp'
 		// populate db
 		_, err = db.Exec(`create table patients (
 						  id SERIAL PRIMARY KEY,
-						  first_name TEXT NOT NULL,
-						  first_name_bidx1 tinyint unsigned NOT NULL, -- 1 letter
-						  first_name_bidx2 tinyint unsigned NOT NULL, -- 2 letters
-						  first_name_bidx3 tinyint unsigned NOT NULL, -- 3 letters
-						  first_name_bidx4 tinyint unsigned NOT NULL, -- 4 letters
-						  last_name TEXT NOT NULL,
-						  last_name_bidx1 tinyint unsigned NOT NULL, -- 1 letter
-						  last_name_bidx2 tinyint unsigned NOT NULL, -- 2 letters
-						  last_name_bidx3 tinyint unsigned NOT NULL, -- 3 letters
-						  last_name_bidx4 tinyint unsigned NOT NULL, -- 4 letters
-						  INDEX (first_name_bidx1),
-						  INDEX (first_name_bidx1, first_name_bidx2),
-						  INDEX (first_name_bidx1, first_name_bidx2, first_name_bidx3),
-						  INDEX (first_name_bidx1, first_name_bidx2, first_name_bidx3, first_name_bidx4),
-						  INDEX (last_name_bidx1),
-						  INDEX (last_name_bidx1, last_name_bidx2),
-						  INDEX (last_name_bidx1, last_name_bidx2, last_name_bidx3),
-						  INDEX (last_name_bidx1, last_name_bidx2, last_name_bidx3, last_name_bidx4)
+						  first_name VARCHAR(64) NOT NULL,
+						  first_name_bidx MEDIUMINT UNSIGNED NOT NULL,
+						  last_name VARCHAR(64) NOT NULL,
+						  last_name_bidx MEDIUMINT UNSIGNED NOT NULL,
+						  INDEX (first_name_bidx),
+						  INDEX (last_name_bidx)
 						);`,
 		)
 		if err != nil {
 			panic(err)
 		}
-		_, err = db.Exec(`create table patients_comp (
-						  id SERIAL PRIMARY KEY,
-						  first_name TEXT NOT NULL,
-						  last_name TEXT NOT NULL
-						);`,
-		)
-		if err != nil {
-			panic(err)
-		}
+		// _, err = db.Exec(`create table patients_comp (
+		// 				  id SERIAL PRIMARY KEY,
+		// 				  first_name_cmp VARCHAR(100) NOT NULL,
+		// 				  last_name_cmp VARCHAR(100) NOT NULL
+		// 				);`,
+		// )
+		// if err != nil {
+		// 	panic(err)
+		// }
 	case "populate":
+		chunkSize := 100
+		usersPerCount := 5000
 		affectedRows := 0
+		affectedCh := make(chan int64, 1000)
+		doneWithPopulateCh := make(chan any)
+		go func() {
+			for affected := range affectedCh {
+				affectedRows += int(affected)
+				fmt.Printf("done %d/%d...\n", affectedRows, count*usersPerCount)
+			}
+			doneWithPopulateCh <- nil
+		}()
+		wg := sync.WaitGroup{}
+		lck := make(chan byte, 20)
+		for range 20 {
+			lck <- 0
+		}
 		for range count {
-			_, err = db.Exec(insertNamesCmp)
+			wg.Add(usersPerCount / chunkSize)
+			randomUsers, err := getRandomUsers(usersPerCount, "de")
 			if err != nil {
 				panic(err)
 			}
-
-			res, err := db.Query("SELECT TABLE_NAME AS `Table`, ROUND((DATA_LENGTH + INDEX_LENGTH)) AS `Size (B)` FROM information_schema.TABLES WHERE TABLE_NAME='patients' or TABLE_NAME='patients_comp'")
-			if err != nil {
-				panic(err)
+			fmt.Printf("got %d random users...\n", len(randomUsers))
+			usersChunked := [][]User{}
+			for i := range usersPerCount / chunkSize {
+				usersChunked = append(usersChunked, randomUsers[i*chunkSize:(i+1)*chunkSize])
 			}
-			for res.Next() {
-				var tbl string
-				var sizeMb int
-				err = res.Scan(&tbl, &sizeMb)
-				if err != nil {
-					panic(err)
-				}
-				fmt.Printf("Table: %s, Size (B): %d\n", tbl, sizeMb)
-			}
-			r := csv.NewReader(strings.NewReader(nameList))
+			for _, users := range usersChunked {
 
-			affectedCh := make(chan int64, 1000)
+				nQueryParams := 4
+				queryParams := make([]interface{}, chunkSize*nQueryParams)
+				// nCompQueryParams := 2
+				// compQueryParams := make([]interface{}, chunkSize*nCompQueryParams)
+				// patientsCompQuery := `insert into patients_comp (
+				// first_name,
+				// last_name)
+				// values `
+				patientsQuery := `insert into patients (
+				first_name,
+				first_name_bidx,
+				last_name,
+				last_name_bidx
+				)
+				values `
 
-			go func() {
-				for affected := range affectedCh {
-					affectedRows += int(affected)
-					if affectedRows%1000 == 0 {
-						fmt.Printf("done %d/%d...\n", affectedRows, count*85000)
-					}
-				}
-			}()
-			wg := sync.WaitGroup{}
-			lck := make(chan byte, 20)
-			for range 20 {
-				lck <- 0
-			}
-			for {
-				record, cerr := r.Read()
-				if cerr == io.EOF {
-					break
-				}
-				if cerr != nil {
-					log.Fatal(cerr)
-				}
+				for i, user := range users {
+					// patientsCompQuery += `(?,?),`
+					// compQueryParams[i*nCompQueryParams+0] = user.Name.FirstName
+					// compQueryParams[i*nCompQueryParams+1] = user.Name.LastName
 
-				// fmt.Printf("name splitting\n")
-				firstName := record[0]
-				lastName := record[1]
-
-				<-lck
-				wg.Add(1)
-				go func() {
-					// padding to guarantee length
-					firstNamePadded := firstName + "      "
-					lastNamePadded := lastName + "      "
+					firstNamePadded := user.Name.FirstName + "       "
+					lastNamePadded := user.Name.LastName + "       "
 					firstNameHmac1 := createHmac(firstNamePadded[:1])
 					firstNameHmac2 := createHmac(firstNamePadded[:2])
 					firstNameHmac3 := createHmac(firstNamePadded[:3])
 					firstNameHmac4 := createHmac(firstNamePadded[:4])
-					// firstNameHmac5 := createHmac(firstNamePadded[:5])
+					firstNameHmac5 := createHmac(firstNamePadded[:5])
 					lastNameHmac1 := createHmac(lastNamePadded[:1])
 					lastNameHmac2 := createHmac(lastNamePadded[:2])
 					lastNameHmac3 := createHmac(lastNamePadded[:3])
 					lastNameHmac4 := createHmac(lastNamePadded[:4])
-					// lastNameHmac5 := createHmac(lastNamePadded[:5])
+					lastNameHmac5 := createHmac(lastNamePadded[:5])
+					patientsQuery += `(?,?,?,?),`
+					queryParams[i*nQueryParams+0] = user.Name.FirstName
+					queryParams[i*nQueryParams+1] = combineHmacs(firstNameHmac1, firstNameHmac2, firstNameHmac3, firstNameHmac4, firstNameHmac5)
+					// queryParams[i*nQueryParams+2] = firstNameHmac2
+					// queryParams[i*nQueryParams+3] = firstNameHmac3
+					// queryParams[i*nQueryParams+4] = firstNameHmac4
+					queryParams[i*nQueryParams+2] = user.Name.LastName
+					queryParams[i*nQueryParams+3] = combineHmacs(lastNameHmac1, lastNameHmac2, lastNameHmac3, lastNameHmac4, lastNameHmac5)
+					// queryParams[i*nQueryParams+7] = lastNameHmac2
+					// queryParams[i*nQueryParams+8] = lastNameHmac3
+					// queryParams[i*nQueryParams+9] = lastNameHmac4
+				}
+				// patientsCompQuery = patientsCompQuery[0 : len(patientsCompQuery)-1]
+				patientsQuery = patientsQuery[0 : len(patientsQuery)-1]
 
-					res, cerr := db.Exec(`insert into patients (
-				first_name, 
-				first_name_bidx1, 
-				first_name_bidx2, 
-				first_name_bidx3, 
-				first_name_bidx4,
-		--		first_name_bidx5, 
-				last_name, 
-				last_name_bidx1, 
-				last_name_bidx2, 
-				last_name_bidx3, 
-				last_name_bidx4 
-		--		last_name_bidx5
-				)
-				values (
-				?,
-				?,
-				?,
-				?,
-				?,
-			--	?,
-			--	?,
-				?,
-				?,
-				?,
-				?,
-				?)`,
-						firstName,
-						firstNameHmac1,
-						firstNameHmac2,
-						firstNameHmac3,
-						firstNameHmac4,
-						// firstNameHmac5,
-						lastName,
-						lastNameHmac1,
-						lastNameHmac2,
-						lastNameHmac3,
-						lastNameHmac4,
-					// lastNameHmac5
-					)
+				go func() {
+					<-lck
+					// _, cerr := db.Exec(patientsCompQuery, compQueryParams...)
+					// if cerr != nil {
+					// 	panic(cerr)
+					// }
+					res, cerr := db.Exec(patientsQuery, queryParams...)
 					if cerr != nil {
 						panic(cerr)
 					}
@@ -413,21 +443,9 @@ OR table_name = 'patients_comp'
 				}()
 			}
 			wg.Wait()
-			close(affectedCh)
-			fmt.Printf("affected %d rows\n", affectedRows)
-			res, err = db.Query("SELECT TABLE_NAME AS `Table`, ROUND((DATA_LENGTH + INDEX_LENGTH)) AS `Size (B)` FROM information_schema.TABLES WHERE TABLE_NAME='patients' or TABLE_NAME='patients_comp'")
-			if err != nil {
-				panic(err)
-			}
-			for res.Next() {
-				var tbl string
-				var sizeMb int
-				err = res.Scan(&tbl, &sizeMb)
-				if err != nil {
-					panic(err)
-				}
-				fmt.Printf("Table: %s, Size (B): %d\n", tbl, sizeMb)
-			}
 		}
+		close(affectedCh)
+		<-doneWithPopulateCh
+		fmt.Printf("affected %d rows\n", affectedRows)
 	}
 }
