@@ -26,13 +26,14 @@ func createHmac(plain string) byte {
 	return mac.Sum(nil)[0]
 }
 
-func combineHmacs(letters1 byte, letters2 byte, letters3 byte, letters4 byte, letters5 byte) uint32 {
+func combineHmacs(letters1 byte, letters2 byte, letters3 byte, letters4 byte, letters5 byte, letters6 byte) uint32 {
 	return uint32(
 		((uint32(letters1)&0x1f)<<0)|
-			((uint32(letters2)&0x1f)<<5)|
-			((uint32(letters3)&0x1f)<<10)|
-			((uint32(letters4)&0x1f)<<15)|
-			((uint32(letters5)&0x1f)<<20),
+			((uint32(letters2)&0x0f)<<5)|
+			((uint32(letters3)&0x0f)<<9)|
+			((uint32(letters4)&0x0f)<<13)|
+			((uint32(letters5)&0x0f)<<17)|
+			((uint32(letters6)&0x07)<<21),
 	) & 0xffffff
 	// ((int32(letters5) & 0x3f) << 24))
 }
@@ -96,7 +97,7 @@ func getRandomUsers(amount int, nationality string) ([]User, error) {
 func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	switch len(search) {
 	case 1:
-		hmac := combineHmacs(createHmac(search[:1]), 0, 0, 0, 0)
+		hmac := combineHmacs(createHmac(search[:1]), 0, 0, 0, 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
 			first_name_bidx & X'1F' = ? 
 			or last_name_bidx & X'1F' = ?
@@ -106,25 +107,25 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 			hmac,
 		)
 	case 2:
-		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), 0, 0, 0)
+		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), 0, 0, 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'03FF' = ? 
-			or last_name_bidx & X'03FF' = ?
+			first_name_bidx & X'01FF' = ? 
+			or last_name_bidx & X'01FF' = ?
 		--	LIMIT 1000;`,
 			hmac,
 			hmac,
 		)
 	case 3:
-		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), 0, 0)
+		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), 0, 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'7FFF' = ?
-			or last_name_bidx & X'7FFF' = ?
+			first_name_bidx & X'1FFF' = ?
+			or last_name_bidx & X'1FFF' = ?
 			-- LIMIT 1000;`,
 			hmac,
 			hmac,
 		)
 	case 4:
-		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), 0)
+		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
 			first_name_bidx & X'01FFFF' = ? 
 			or last_name_bidx & X'01FFFF' = ?
@@ -132,11 +133,20 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 			hmac,
 			hmac,
 		)
-	default:
-		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), createHmac(search[:5]))
+	case 5:
+		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), createHmac(search[:5]), 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'3FFFFF' = ? 
-			or last_name_bidx & X'3FFFFF' = ?
+			first_name_bidx & X'1FFFFF' = ? 
+			or last_name_bidx & X'1FFFFF' = ?
+			-- LIMIT 1000;`,
+			hmac,
+			hmac,
+		)
+	default:
+		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), createHmac(search[:5]), createHmac(search[:6]))
+		return db.Query(`select first_name, last_name from patients where 
+			first_name_bidx & X'FFFFFF' = ? 
+			or last_name_bidx & X'FFFFFF' = ?
 			-- LIMIT 1000;`,
 			hmac,
 			hmac,
@@ -398,26 +408,28 @@ OR table_name = 'patients_comp'
 					// compQueryParams[i*nCompQueryParams+0] = user.Name.FirstName
 					// compQueryParams[i*nCompQueryParams+1] = user.Name.LastName
 
-					firstNamePadded := user.Name.FirstName + "       "
-					lastNamePadded := user.Name.LastName + "       "
+					firstNamePadded := user.Name.FirstName + "        "
+					lastNamePadded := user.Name.LastName + "        "
 					firstNameHmac1 := createHmac(firstNamePadded[:1])
 					firstNameHmac2 := createHmac(firstNamePadded[:2])
 					firstNameHmac3 := createHmac(firstNamePadded[:3])
 					firstNameHmac4 := createHmac(firstNamePadded[:4])
 					firstNameHmac5 := createHmac(firstNamePadded[:5])
+					firstNameHmac6 := createHmac(firstNamePadded[:6])
 					lastNameHmac1 := createHmac(lastNamePadded[:1])
 					lastNameHmac2 := createHmac(lastNamePadded[:2])
 					lastNameHmac3 := createHmac(lastNamePadded[:3])
 					lastNameHmac4 := createHmac(lastNamePadded[:4])
 					lastNameHmac5 := createHmac(lastNamePadded[:5])
+					lastNameHmac6 := createHmac(lastNamePadded[:6])
 					patientsQuery += `(?,?,?,?),`
 					queryParams[i*nQueryParams+0] = user.Name.FirstName
-					queryParams[i*nQueryParams+1] = combineHmacs(firstNameHmac1, firstNameHmac2, firstNameHmac3, firstNameHmac4, firstNameHmac5)
+					queryParams[i*nQueryParams+1] = combineHmacs(firstNameHmac1, firstNameHmac2, firstNameHmac3, firstNameHmac4, firstNameHmac5, firstNameHmac6)
 					// queryParams[i*nQueryParams+2] = firstNameHmac2
 					// queryParams[i*nQueryParams+3] = firstNameHmac3
 					// queryParams[i*nQueryParams+4] = firstNameHmac4
 					queryParams[i*nQueryParams+2] = user.Name.LastName
-					queryParams[i*nQueryParams+3] = combineHmacs(lastNameHmac1, lastNameHmac2, lastNameHmac3, lastNameHmac4, lastNameHmac5)
+					queryParams[i*nQueryParams+3] = combineHmacs(lastNameHmac1, lastNameHmac2, lastNameHmac3, lastNameHmac4, lastNameHmac5, lastNameHmac6)
 					// queryParams[i*nQueryParams+7] = lastNameHmac2
 					// queryParams[i*nQueryParams+8] = lastNameHmac3
 					// queryParams[i*nQueryParams+9] = lastNameHmac4
