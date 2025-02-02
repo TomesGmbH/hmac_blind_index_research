@@ -1,22 +1,25 @@
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
+	"encoding/csv"
 	"flag"
 	"fmt"
-	"net/http"
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	_ "embed"
 
 	_ "github.com/go-sql-driver/mysql"
 )
+
+//go:embed random_names_1million.csv
+var millionRandomNames []byte
+var namesReader = bytes.NewReader(millionRandomNames)
 
 var key = []byte("qhmQvFgKBJGaaRADCUmLMMb0lVtm6fLq")
 
@@ -28,12 +31,12 @@ func createHmac(plain string) byte {
 
 func combineHmacs(letters1 byte, letters2 byte, letters3 byte, letters4 byte, letters5 byte, letters6 byte) uint32 {
 	return uint32(
-		((uint32(letters1)&0x3f)<<0)|
-			((uint32(letters2)&0x1f)<<6)|
-			((uint32(letters3)&0x0f)<<11)|
-			((uint32(letters4)&0x07)<<15)|
-			((uint32(letters5)&0x07)<<18)|
-			((uint32(letters6)&0x07)<<21),
+		((uint32(letters1)&0x7f)<<0)|
+			((uint32(letters2)&0x3f)<<7)|
+			((uint32(letters3)&0x0f)<<13)|
+			((uint32(letters4)&0x07)<<17)|
+			((uint32(letters5)&0x03)<<20)|
+			((uint32(letters6)&0x03)<<22),
 	) & 0xffffff
 	// ((int32(letters5) & 0x3f) << 24))
 }
@@ -58,40 +61,55 @@ type GetUsersResponse struct {
 	Results []User `json:"results"`
 }
 
-var lastRequest = time.Time{}
+// var lastRequest = time.Time{}
 
 var lck = sync.Mutex{}
 
-const throttleRandomUsersSeconds = 20
+// const throttleRandomUsersSeconds = 20
 
-func getRandomUsers(amount int, nationality string) ([]User, error) {
+func getRandomUsers(amount int, _ string) ([]User, error) {
 	lck.Lock()
 	defer lck.Unlock()
-	sinceLast := time.Since(lastRequest)
-	fmt.Printf("last requested users %d ago at %s\n", sinceLast, lastRequest.Format("3:04:05PM"))
-	if sinceLast <= (throttleRandomUsersSeconds * time.Second) {
-		fmt.Printf("Waiting %d seconds to make api request to respect their limits\n", (throttleRandomUsersSeconds*time.Second-sinceLast)/time.Second)
-		<-time.After(throttleRandomUsersSeconds*time.Second - sinceLast)
-	}
-	for {
-		lastRequest = time.Now()
-		res, err := http.Get(fmt.Sprintf("https://randomuser.me/api?results=%d&nat=%s&inc=name&noinfo", amount, nationality))
+	reader := csv.NewReader(namesReader)
+	reader.FieldsPerRecord = 2
+	users := make([]User, amount)
+	for i := range amount {
+		offset := reader.InputOffset()
+		fmt.Println(offset)
+		record, err := reader.Read()
 		if err != nil {
 			return nil, err
 		}
-		defer res.Body.Close()
-		decoder := json.NewDecoder(res.Body)
-		usersResponse := GetUsersResponse{Results: []User{}}
-		err = decoder.Decode(&usersResponse)
-		if err != nil {
-			return nil, err
-		}
-		if usersResponse.Error == "" {
-			return usersResponse.Results, nil
-		}
-		fmt.Printf("Error while getting random users: %q. Retrying...\n", usersResponse.Error)
-		<-time.After(120 * time.Second)
+		users[i].Name = UserName{FirstName: record[0], LastName: record[1]}
 	}
+	return users, nil
+	// lck.Lock()
+	// defer lck.Unlock()
+	// sinceLast := time.Since(lastRequest)
+	// fmt.Printf("last requested users %d ago at %s\n", sinceLast, lastRequest.Format("3:04:05PM"))
+	// if sinceLast <= (throttleRandomUsersSeconds * time.Second) {
+	// 	fmt.Printf("Waiting %d seconds to make api request to respect their limits\n", (throttleRandomUsersSeconds*time.Second-sinceLast)/time.Second)
+	// 	<-time.After(throttleRandomUsersSeconds*time.Second - sinceLast)
+	// }
+	// for {
+	// 	lastRequest = time.Now()
+	// 	res, err := http.Get(fmt.Sprintf("https://randomuser.me/api?results=%d&nat=%s&inc=name&noinfo", amount, nationality))
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	defer res.Body.Close()
+	// 	decoder := json.NewDecoder(res.Body)
+	// 	usersResponse := GetUsersResponse{Results: []User{}}
+	// 	err = decoder.Decode(&usersResponse)
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	if usersResponse.Error == "" {
+	// 		return usersResponse.Results, nil
+	// 	}
+	// 	fmt.Printf("Error while getting random users: %q. Retrying...\n", usersResponse.Error)
+	// 	<-time.After(120 * time.Second)
+	// }
 }
 
 func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
@@ -99,8 +117,8 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	case 1:
 		hmac := combineHmacs(createHmac(search[:1]), 0, 0, 0, 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'3F' = ? 
-			or last_name_bidx & X'3F' = ?
+			first_name_bidx & X'7F' = ? 
+			or last_name_bidx & X'7F' = ?
 		--	LIMIT 1000
 			;`,
 			hmac,
@@ -109,8 +127,8 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	case 2:
 		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), 0, 0, 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'07FF' = ? 
-			or last_name_bidx & X'07FF' = ?
+			first_name_bidx & X'1FFF' = ? 
+			or last_name_bidx & X'1FFF' = ?
 		--	LIMIT 1000;`,
 			hmac,
 			hmac,
@@ -118,8 +136,8 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	case 3:
 		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), 0, 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'7FFF' = ?
-			or last_name_bidx & X'7FFF' = ?
+			first_name_bidx & X'01FFFF' = ?
+			or last_name_bidx & X'01FFFF' = ?
 			-- LIMIT 1000;`,
 			hmac,
 			hmac,
@@ -127,8 +145,8 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	case 4:
 		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'03FFFF' = ? 
-			or last_name_bidx & X'03FFFF' = ?
+			first_name_bidx & X'0FFFFF' = ? 
+			or last_name_bidx & X'0FFFFF' = ?
 			-- LIMIT 1000;`,
 			hmac,
 			hmac,
@@ -136,8 +154,8 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	case 5:
 		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), createHmac(search[:5]), 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'1FFFFF' = ? 
-			or last_name_bidx & X'1FFFFF' = ?
+			first_name_bidx & X'3FFFFF' = ? 
+			or last_name_bidx & X'3FFFFF' = ?
 			-- LIMIT 1000;`,
 			hmac,
 			hmac,
@@ -357,8 +375,8 @@ OR table_name = 'patients_comp'
 		// 	panic(err)
 		// }
 	case "populate":
-		chunkSize := 100
-		usersPerCount := 5000
+		chunkSize := 10000
+		usersPerCount := 1000000
 		affectedRows := 0
 		affectedCh := make(chan int64, 1000)
 		doneWithPopulateCh := make(chan any)
