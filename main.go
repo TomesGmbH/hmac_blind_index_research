@@ -21,9 +21,10 @@ import (
 var millionRandomNames []byte
 var namesReader = bytes.NewReader(millionRandomNames)
 
-var key = []byte("qhmQvFgKBJGaaRADCUmLMMb0lVtm6fLq")
+var key = []byte("qhmQvFgKBJGa_FAKE_KEY_b0lVtm6fLq")
 
 func createHmac(plain string) byte {
+	plain = strings.ToLower(plain[len(plain)-1:])
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(plain))
 	return mac.Sum(nil)[0]
@@ -119,7 +120,7 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 		return db.Query(`select first_name, last_name from patients where 
 			first_name_bidx & X'7F' = ? 
 			or last_name_bidx & X'7F' = ?
-		--	LIMIT 1000
+			LIMIT 1000
 			;`,
 			hmac,
 			hmac,
@@ -129,7 +130,7 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 		return db.Query(`select first_name, last_name from patients where 
 			first_name_bidx & X'1FFF' = ? 
 			or last_name_bidx & X'1FFF' = ?
-		--	LIMIT 1000;`,
+	    	LIMIT 1000;`,
 			hmac,
 			hmac,
 		)
@@ -138,7 +139,7 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 		return db.Query(`select first_name, last_name from patients where 
 			first_name_bidx & X'01FFFF' = ?
 			or last_name_bidx & X'01FFFF' = ?
-			-- LIMIT 1000;`,
+			LIMIT 1000;`,
 			hmac,
 			hmac,
 		)
@@ -147,7 +148,7 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 		return db.Query(`select first_name, last_name from patients where 
 			first_name_bidx & X'0FFFFF' = ? 
 			or last_name_bidx & X'0FFFFF' = ?
-			-- LIMIT 1000;`,
+			LIMIT 1000;`,
 			hmac,
 			hmac,
 		)
@@ -156,7 +157,7 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 		return db.Query(`select first_name, last_name from patients where 
 			first_name_bidx & X'3FFFFF' = ? 
 			or last_name_bidx & X'3FFFFF' = ?
-			-- LIMIT 1000;`,
+			LIMIT 1000;`,
 			hmac,
 			hmac,
 		)
@@ -165,7 +166,7 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 		return db.Query(`select first_name, last_name from patients where 
 			first_name_bidx & X'FFFFFF' = ? 
 			or last_name_bidx & X'FFFFFF' = ?
-			-- LIMIT 1000;`,
+			LIMIT 1000;`,
 			hmac,
 			hmac,
 		)
