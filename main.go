@@ -28,11 +28,11 @@ func createHmac(plain string) byte {
 
 func combineHmacs(letters1 byte, letters2 byte, letters3 byte, letters4 byte, letters5 byte, letters6 byte) uint32 {
 	return uint32(
-		((uint32(letters1)&0x1f)<<0)|
-			((uint32(letters2)&0x0f)<<5)|
-			((uint32(letters3)&0x0f)<<9)|
-			((uint32(letters4)&0x0f)<<13)|
-			((uint32(letters5)&0x0f)<<17)|
+		((uint32(letters1)&0x3f)<<0)|
+			((uint32(letters2)&0x1f)<<6)|
+			((uint32(letters3)&0x0f)<<11)|
+			((uint32(letters4)&0x07)<<15)|
+			((uint32(letters5)&0x07)<<18)|
 			((uint32(letters6)&0x07)<<21),
 	) & 0xffffff
 	// ((int32(letters5) & 0x3f) << 24))
@@ -99,8 +99,8 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	case 1:
 		hmac := combineHmacs(createHmac(search[:1]), 0, 0, 0, 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'1F' = ? 
-			or last_name_bidx & X'1F' = ?
+			first_name_bidx & X'3F' = ? 
+			or last_name_bidx & X'3F' = ?
 		--	LIMIT 1000
 			;`,
 			hmac,
@@ -109,8 +109,8 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	case 2:
 		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), 0, 0, 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'01FF' = ? 
-			or last_name_bidx & X'01FF' = ?
+			first_name_bidx & X'07FF' = ? 
+			or last_name_bidx & X'07FF' = ?
 		--	LIMIT 1000;`,
 			hmac,
 			hmac,
@@ -118,8 +118,8 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	case 3:
 		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), 0, 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'1FFF' = ?
-			or last_name_bidx & X'1FFF' = ?
+			first_name_bidx & X'7FFF' = ?
+			or last_name_bidx & X'7FFF' = ?
 			-- LIMIT 1000;`,
 			hmac,
 			hmac,
@@ -127,8 +127,8 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	case 4:
 		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), 0, 0)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'01FFFF' = ? 
-			or last_name_bidx & X'01FFFF' = ?
+			first_name_bidx & X'03FFFF' = ? 
+			or last_name_bidx & X'03FFFF' = ?
 			-- LIMIT 1000;`,
 			hmac,
 			hmac,
