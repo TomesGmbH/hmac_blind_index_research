@@ -21,25 +21,78 @@ import (
 var millionRandomNames []byte
 var namesReader = bytes.NewReader(millionRandomNames)
 
-var key = []byte("qhmQvFgKBJGa_FAKE_KEY_b0lVtm6fLq")
+var (
+	key1 = []byte("qhmQvonoeuGa_FAKE_KEY_1_lVtm6fLq")
+	key2 = []byte("blindindexGa_FAKE_KEY_2_lVtm6fLq")
+	key3 = []byte("iaminvalidat_FAKE_KEY_3_lVtm6fLq")
+	key4 = []byte("testtestBJGa_FAKE_KEY_4_lVtm6fLq")
+	key5 = []byte("qhmQsometext_FAKE_KEY_5_lVtm6fLq")
+	key6 = []byte("qthisisaBJGa_FAKE_KEY_6_lVtm6fLq")
+)
 
-func createHmac(plain string) byte {
-	plain = strings.ToLower(plain[len(plain)-1:])
+func createHmac(plain string, key []byte) byte {
+	plain = strings.ToLower(plain)
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(plain))
-	return mac.Sum(nil)[0]
+	hash := mac.Sum(nil)
+	return byte(hash[1] + 1)
+}
+
+func truncLetterCount(letterCount int) int {
+	return max(0, min(letterCount, 6))
+}
+
+func bitPattern(letterCount int) uint32 {
+	pattern := uint32(0)
+	for range bitCount(truncLetterCount(letterCount)) {
+		pattern = (pattern << 1) | 0x01
+	}
+	return uint32(pattern)
+}
+
+func bitCount(letterCount int) uint32 {
+	switch truncLetterCount(letterCount) {
+	case 1:
+		return 7
+	case 2:
+		return 6
+	case 3:
+		return 5
+	case 4:
+		return 2
+	case 5:
+		return 2
+	case 6:
+		return 2
+	}
+	return 0
+}
+
+func bitShift(letterCount int) uint32 {
+	shift := uint32(0)
+	for i := range truncLetterCount(letterCount) {
+		shift += bitCount(i)
+	}
+	return uint32(shift)
+}
+
+func bitMask(letterCount int) uint32 {
+	bitMask := uint32(0)
+	for i := range truncLetterCount(letterCount) {
+		bitMask = bitMask | bitPattern(i+1)<<bitShift(i+1)
+	}
+	return bitMask
 }
 
 func combineHmacs(letters1 byte, letters2 byte, letters3 byte, letters4 byte, letters5 byte, letters6 byte) uint32 {
 	return uint32(
-		((uint32(letters1)&0x7f)<<0)|
-			((uint32(letters2)&0x3f)<<7)|
-			((uint32(letters3)&0x0f)<<13)|
-			((uint32(letters4)&0x07)<<17)|
-			((uint32(letters5)&0x03)<<20)|
-			((uint32(letters6)&0x03)<<22),
-	) & 0xffffff
-	// ((int32(letters5) & 0x3f) << 24))
+		((uint32(letters1)&bitPattern(1))<<bitShift(1))|
+			((uint32(letters2)&bitPattern(2))<<bitShift(2))|
+			((uint32(letters3)&bitPattern(3))<<bitShift(3))|
+			((uint32(letters4)&bitPattern(4))<<bitShift(4))|
+			((uint32(letters5)&bitPattern(5))<<bitShift(5))|
+			((uint32(letters6)&bitPattern(6))<<bitShift(6)),
+	) & 0xffffffff
 }
 
 type SearchResult struct {
@@ -75,8 +128,8 @@ func getRandomUsers(amount int, _ string) ([]User, error) {
 	reader.FieldsPerRecord = 2
 	users := make([]User, amount)
 	for i := range amount {
-		offset := reader.InputOffset()
-		fmt.Println(offset)
+		// offset := reader.InputOffset()
+		// fmt.Println(offset)
 		record, err := reader.Read()
 		if err != nil {
 			return nil, err
@@ -116,59 +169,83 @@ func getRandomUsers(amount int, _ string) ([]User, error) {
 func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	switch len(search) {
 	case 1:
-		hmac := combineHmacs(createHmac(search[:1]), 0, 0, 0, 0, 0)
+		hmac := combineHmacs(createHmac(search[:1], key1), 0, 0, 0, 0, 0)
+		fmt.Printf("hmac: 0x%x\n", hmac)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'7F' = ? 
-			or last_name_bidx & X'7F' = ?
-			LIMIT 1000
+			(first_name_bidx & ?) = ? 
+			or (last_name_bidx & ?) = ?
+			LIMIT ?
 			;`,
+			bitMask(1),
 			hmac,
+			bitMask(1),
 			hmac,
+			searchLimit,
 		)
 	case 2:
-		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), 0, 0, 0, 0)
+		hmac := combineHmacs(createHmac(search[:1], key1), createHmac(search[:2], key2), 0, 0, 0, 0)
+		fmt.Printf("hmac: 0x%x\n", hmac)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'1FFF' = ? 
-			or last_name_bidx & X'1FFF' = ?
-	    	LIMIT 1000;`,
+			(first_name_bidx & ?) = ? 
+			or (last_name_bidx & ?) = ?
+	    	LIMIT ?;`,
+			bitMask(2),
 			hmac,
+			bitMask(2),
 			hmac,
+			searchLimit,
 		)
 	case 3:
-		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), 0, 0, 0)
+		hmac := combineHmacs(createHmac(search[:1], key1), createHmac(search[:2], key2), createHmac(search[:3], key3), 0, 0, 0)
+		fmt.Printf("hmac: 0x%x\n", hmac)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'01FFFF' = ?
-			or last_name_bidx & X'01FFFF' = ?
-			LIMIT 1000;`,
+			(first_name_bidx & ?) = ?
+			or (last_name_bidx & ?) = ?
+			LIMIT ?;`,
+			bitMask(3),
 			hmac,
+			bitMask(3),
 			hmac,
+			searchLimit,
 		)
 	case 4:
-		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), 0, 0)
+		hmac := combineHmacs(createHmac(search[:1], key1), createHmac(search[:2], key2), createHmac(search[:3], key3), createHmac(search[:4], key4), 0, 0)
+		fmt.Printf("hmac: 0x%x\n", hmac)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'0FFFFF' = ? 
-			or last_name_bidx & X'0FFFFF' = ?
-			LIMIT 1000;`,
+			(first_name_bidx & ?) = ? 
+			or (last_name_bidx & ?) = ?
+			LIMIT ?;`,
+			bitMask(4),
 			hmac,
+			bitMask(4),
 			hmac,
+			searchLimit,
 		)
 	case 5:
-		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), createHmac(search[:5]), 0)
+		hmac := combineHmacs(createHmac(search[:1], key1), createHmac(search[:2], key2), createHmac(search[:3], key3), createHmac(search[:4], key4), createHmac(search[:5], key5), 0)
+		fmt.Printf("hmac: 0x%x\n", hmac)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'3FFFFF' = ? 
-			or last_name_bidx & X'3FFFFF' = ?
-			LIMIT 1000;`,
+			(first_name_bidx & ?) = ? 
+			or (last_name_bidx & ?) = ?
+			LIMIT ?;`,
+			bitMask(5),
 			hmac,
+			bitMask(5),
 			hmac,
+			searchLimit,
 		)
 	default:
-		hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), createHmac(search[:5]), createHmac(search[:6]))
+		hmac := combineHmacs(createHmac(search[:1], key1), createHmac(search[:2], key2), createHmac(search[:3], key3), createHmac(search[:4], key4), createHmac(search[:5], key5), createHmac(search[:6], key6))
+		fmt.Printf("hmac: 0x%x\n", hmac)
 		return db.Query(`select first_name, last_name from patients where 
-			first_name_bidx & X'FFFFFF' = ? 
-			or last_name_bidx & X'FFFFFF' = ?
-			LIMIT 1000;`,
+			(first_name_bidx & ?) = ? 
+			or (last_name_bidx & ?) = ?
+			LIMIT ?;`,
+			bitMask(6),
 			hmac,
+			bitMask(6),
 			hmac,
+			searchLimit,
 		)
 		// default:
 		// 	hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), createHmac(search[:5]))
@@ -196,6 +273,8 @@ func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
 	}
 }
 
+var searchLimit int
+
 func main() {
 	var command string
 	flag.StringVar(&command, "command", "search", "enter 'search', 'populate', 'stats', or 'prep'")
@@ -203,6 +282,7 @@ func main() {
 	flag.StringVar(&search, "search", "", "enter text to search if searching")
 	var count int
 	flag.IntVar(&count, "count", 1, "enter loops of inserting")
+	flag.IntVar(&searchLimit, "limit", 1000, "enter search limit")
 	flag.Parse()
 
 	db, err := sql.Open("mysql", "root:password@tcp(127.0.0.1:3306)/db")
@@ -274,29 +354,38 @@ OR table_name = 'patients_comp'
 		}
 	case "search":
 		fmt.Printf("searching for %q\n", search)
-		fmt.Printf("hmac\n")
 		rows, err := queryFor(db, search)
 		if err != nil {
 			panic(err)
 		}
 		values := []SearchResult{}
+		valuesMatchingWholeSearch := 0
 		for rows.Next() {
 			value := SearchResult{}
 			err = rows.Scan(&value.first_name, &value.last_name)
 			if err != nil {
 				panic(err)
 			}
+			firstNameLower := strings.ToLower(value.first_name)
+			lastNameLower := strings.ToLower(value.last_name)
+			searchLower := strings.ToLower(search)
+			checkFirstName := true
+			checkLastName := true
 			value.matching_letters_fn = 0
 			value.matching_letters_ln = 0
-			for i, l := range []byte(search) {
-				if len(value.first_name) > i {
-					if value.first_name[i] == l {
+			for i := range searchLower {
+				if checkFirstName && len(firstNameLower) > i {
+					if firstNameLower[i] == searchLower[i] {
 						value.matching_letters_fn++
+					} else {
+						checkFirstName = false
 					}
 				}
-				if len(value.last_name) > i {
-					if value.last_name[i] == l {
+				if checkLastName && len(lastNameLower) > i {
+					if lastNameLower[i] == searchLower[i] {
 						value.matching_letters_ln++
+					} else {
+						checkLastName = false
 					}
 				}
 			}
@@ -308,6 +397,9 @@ OR table_name = 'patients_comp'
 				value.matchWordLen = len([]byte(value.last_name))
 			}
 
+			if value.match == len(search) {
+				valuesMatchingWholeSearch++
+			}
 			values = append(values, value)
 		}
 		if err != nil {
@@ -329,18 +421,19 @@ OR table_name = 'patients_comp'
 		avgMatchWordLenDiff = float64(matchWordLenDiffSum) / float64(len(values))
 		topWordsSlice := slices.Clone(values)
 		slices.SortFunc(topWordsSlice, func(i, j SearchResult) int {
-			return (i.matchWordLen - i.match) - (j.matchWordLen - j.match)
+			return (2*(2*j.match-len(search)) - min(j.matching_letters_fn, j.matching_letters_ln)) - (2*(2*i.match-len(search)) - min(i.matching_letters_fn, i.matching_letters_ln))
 		})
 		topSliceSize := min(10, len(topWordsSlice))
 		topWords := []string{}
 		for _, w := range topWordsSlice[:topSliceSize] {
-			topWords = append(topWords, fmt.Sprintf(`- %s %s`, w.first_name, w.last_name))
+			topWords = append(topWords, fmt.Sprintf(`- %s %s (%d/%d, %d/%d)`, w.first_name, w.last_name, w.matching_letters_fn, len(w.first_name), w.matching_letters_ln, len(w.last_name)))
 			// topWords = append(topWords, fmt.Sprintf(`- %s %s -- match: %d, lenMatchWord: %d, diff: %d`, w.first_name, w.last_name, w.match, w.matchWordLen, w.matchWordLen-w.match))
 		}
 
 		fmt.Printf(
-			"Total matches: %d\naverage matching prefix length: %f\naverage matching word length: %f\naverage matching word length - matching prefix: %f\nTop %d words:\n%s\n",
+			"Total matches: %d\nMatches matching whole search: %d\nAverage matching prefix length: %f\nAverage matching word length: %f\nAverage matching word length - matching prefix: %f\nTop %d words:\n%s\n",
 			len(values),
+			valuesMatchingWholeSearch,
 			avgMatch,
 			avgMatchWordLen,
 			avgMatchWordLenDiff,
@@ -427,20 +520,20 @@ OR table_name = 'patients_comp'
 					// compQueryParams[i*nCompQueryParams+0] = user.Name.FirstName
 					// compQueryParams[i*nCompQueryParams+1] = user.Name.LastName
 
-					firstNamePadded := user.Name.FirstName + "        "
-					lastNamePadded := user.Name.LastName + "        "
-					firstNameHmac1 := createHmac(firstNamePadded[:1])
-					firstNameHmac2 := createHmac(firstNamePadded[:2])
-					firstNameHmac3 := createHmac(firstNamePadded[:3])
-					firstNameHmac4 := createHmac(firstNamePadded[:4])
-					firstNameHmac5 := createHmac(firstNamePadded[:5])
-					firstNameHmac6 := createHmac(firstNamePadded[:6])
-					lastNameHmac1 := createHmac(lastNamePadded[:1])
-					lastNameHmac2 := createHmac(lastNamePadded[:2])
-					lastNameHmac3 := createHmac(lastNamePadded[:3])
-					lastNameHmac4 := createHmac(lastNamePadded[:4])
-					lastNameHmac5 := createHmac(lastNamePadded[:5])
-					lastNameHmac6 := createHmac(lastNamePadded[:6])
+					lowerFirstNamePadded := strings.ToLower(user.Name.FirstName) + "        "
+					lowerLastNamePadded := strings.ToLower(user.Name.LastName) + "        "
+					firstNameHmac1 := createHmac(lowerFirstNamePadded[:1], key1)
+					firstNameHmac2 := createHmac(lowerFirstNamePadded[:2], key2)
+					firstNameHmac3 := createHmac(lowerFirstNamePadded[:3], key3)
+					firstNameHmac4 := createHmac(lowerFirstNamePadded[:4], key4)
+					firstNameHmac5 := createHmac(lowerFirstNamePadded[:5], key5)
+					firstNameHmac6 := createHmac(lowerFirstNamePadded[:6], key6)
+					lastNameHmac1 := createHmac(lowerLastNamePadded[:1], key1)
+					lastNameHmac2 := createHmac(lowerLastNamePadded[:2], key2)
+					lastNameHmac3 := createHmac(lowerLastNamePadded[:3], key3)
+					lastNameHmac4 := createHmac(lowerLastNamePadded[:4], key4)
+					lastNameHmac5 := createHmac(lowerLastNamePadded[:5], key5)
+					lastNameHmac6 := createHmac(lowerLastNamePadded[:6], key6)
 					patientsQuery += `(?,?,?,?),`
 					queryParams[i*nQueryParams+0] = user.Name.FirstName
 					queryParams[i*nQueryParams+1] = combineHmacs(firstNameHmac1, firstNameHmac2, firstNameHmac3, firstNameHmac4, firstNameHmac5, firstNameHmac6)
