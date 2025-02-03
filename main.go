@@ -327,15 +327,24 @@ OR table_name = 'patients_comp'
 		}
 		fmt.Printf("Table: patients\n\t")
 		totalSize := 0
+		bidxSize := 0
+
 		for i, sizeBytes := range patientIndexSizes {
 			if patientIndexNames[i] == "PRIMARY" {
 				fmt.Printf("- Table Data:\n\t  Size: %.2f MB\n\t", float64(sizeBytes)/1024.0/1024.0)
 			} else {
 				fmt.Printf("- Index: %s\n\t  Size: %.2f MB\n\t", patientIndexNames[i], float64(sizeBytes)/1024.0/1024.0)
+				if patientIndexNames[i] != "id" {
+					bidxSize += sizeBytes
+				}
 			}
 			totalSize += sizeBytes
 		}
-		fmt.Printf("\bTotal Size: %.2f MB\n\n", float64(totalSize)/1024.0/1024.0)
+		sizeWithoutBidx := totalSize - bidxSize
+		fmt.Printf("---------------------------\n\t")
+		fmt.Printf("Total Size:          %.2f MB\n\t", float64(totalSize)/1024.0/1024.0)
+		fmt.Printf("Size Without bidx:   %.2f MB\n\t", float64(sizeWithoutBidx)/1024.0/1024.0)
+		fmt.Printf("Bidx Size Increase:  %.2f%s\n\n", 100*float64(totalSize-sizeWithoutBidx)/float64(totalSize), "%")
 		// fmt.Printf("Table: patients_comp\n\t")
 		// totalSize = 0
 		// for i, sizeBytes := range patientCompIndexSizes {
