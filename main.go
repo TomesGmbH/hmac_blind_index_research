@@ -306,8 +306,8 @@ OR table_name = 'patients_comp'
 		}
 		patientIndexSizes := []int{}
 		patientIndexNames := []string{}
-		patientCompIndexSizes := []int{}
-		patientCompIndexNames := []string{}
+		// patientCompIndexSizes := []int{}
+		// patientCompIndexNames := []string{}
 		for res.Next() {
 			var tbl string
 			var index string
@@ -320,25 +320,29 @@ OR table_name = 'patients_comp'
 			case "patients":
 				patientIndexNames = append(patientIndexNames, index)
 				patientIndexSizes = append(patientIndexSizes, indexSizeBytes)
-			case "patients_comp":
-				patientCompIndexNames = append(patientCompIndexNames, index)
-				patientCompIndexSizes = append(patientCompIndexSizes, indexSizeBytes)
+				// case "patients_comp":
+				// 	patientCompIndexNames = append(patientCompIndexNames, index)
+				// 	patientCompIndexSizes = append(patientCompIndexSizes, indexSizeBytes)
 			}
 		}
 		fmt.Printf("Table: patients\n\t")
 		totalSize := 0
 		for i, sizeBytes := range patientIndexSizes {
-			fmt.Printf("- Index: %s\n\t  Size: %.2f\n\t", patientIndexNames[i], float64(sizeBytes)/1024.0/1024.0)
+			if patientIndexNames[i] == "PRIMARY" {
+				fmt.Printf("- Table Data:\n\t  Size: %.2f MB\n\t", float64(sizeBytes)/1024.0/1024.0)
+			} else {
+				fmt.Printf("- Index: %s\n\t  Size: %.2f MB\n\t", patientIndexNames[i], float64(sizeBytes)/1024.0/1024.0)
+			}
 			totalSize += sizeBytes
 		}
-		fmt.Printf("\bTotal Size: %.2f\n\n", float64(totalSize)/1024.0/1024.0)
-		fmt.Printf("Table: patients_comp\n\t")
-		totalSize = 0
-		for i, sizeBytes := range patientCompIndexSizes {
-			fmt.Printf("- Index: %s\n\t  Size: %.2f\n\t", patientCompIndexNames[i], float64(sizeBytes)/1024.0/1024.0)
-			totalSize += sizeBytes
-		}
-		fmt.Printf("\bTotal Size: %.2f\n\n", float64(totalSize)/1024.0/1024.0)
+		fmt.Printf("\bTotal Size: %.2f MB\n\n", float64(totalSize)/1024.0/1024.0)
+		// fmt.Printf("Table: patients_comp\n\t")
+		// totalSize = 0
+		// for i, sizeBytes := range patientCompIndexSizes {
+		// 	fmt.Printf("- Index: %s\n\t  Size: %.2f\n\t", patientCompIndexNames[i], float64(sizeBytes)/1024.0/1024.0)
+		// 	totalSize += sizeBytes
+		// }
+		// fmt.Printf("\bTotal Size: %.2f\n\n", float64(totalSize)/1024.0/1024.0)
 
 		res, err = db.Query("SELECT COUNT(*) FROM patients;")
 		if err != nil {
