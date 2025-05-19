@@ -11,11 +11,30 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	_ "embed"
 
 	_ "github.com/go-sql-driver/mysql"
 )
+
+//go:embed create_customers.sql
+var createCustomersTableSQL string
+
+//go:embed create_patients.sql
+var createPatientsTableSQL string
+
+//go:embed create_fn_index.sql
+var createFnIndexTableSQL string
+
+//go:embed create_ln_index.sql
+var createLnIndexTableSQL string
+
+//go:embed create_automerge.sql
+var createAutomergeTableSQL string
+
+//go:embed select_size.sql
+var tableSizeQuery string
 
 //go:embed random_names_1million.csv
 var millionRandomNames []byte
@@ -68,20 +87,30 @@ func bitCount(letterCount int) uint32 {
 	return 0
 }
 
+func cumulativeBitCount(letterCount int) int {
+	switch truncLetterCount(letterCount) {
+	case 1:
+		return 7
+	case 2:
+		return 7 + 6
+	case 3:
+		return 7 + 6 + 5
+	case 4:
+		return 7 + 6 + 5 + 2
+	case 5:
+		return 7 + 6 + 5 + 2 + 2
+	case 6:
+		return 7 + 6 + 5 + 2 + 2 + 2
+	}
+	return 0
+}
+
 func bitShift(letterCount int) uint32 {
 	shift := uint32(0)
 	for i := range truncLetterCount(letterCount) {
 		shift += bitCount(i)
 	}
 	return uint32(shift)
-}
-
-func bitMask(letterCount int) uint32 {
-	bitMask := uint32(0)
-	for i := range truncLetterCount(letterCount) {
-		bitMask = bitMask | bitPattern(i+1)<<bitShift(i+1)
-	}
-	return bitMask
 }
 
 func combineHmacs(letters1 byte, letters2 byte, letters3 byte, letters4 byte, letters5 byte, letters6 byte) uint32 {
@@ -95,7 +124,126 @@ func combineHmacs(letters1 byte, letters2 byte, letters3 byte, letters4 byte, le
 	) & 0xffffffff
 }
 
+func getKey(index int) []byte {
+	index = min(index, 6)
+	switch index {
+	case 1:
+		return key1
+	case 2:
+		return key2
+	case 3:
+		return key3
+	case 4:
+		return key4
+	case 5:
+		return key5
+	case 6:
+		return key6
+	}
+	return key6
+}
+
+func zeroOrHmac(word string, index int) byte {
+	if len(word) < index {
+		return 0
+	}
+	return createHmac(word[:index], getKey(index))
+}
+
+func getBidxHmac(word string) uint32 {
+	return combineHmacs(zeroOrHmac(word, 1), zeroOrHmac(word, 2), zeroOrHmac(word, 3), zeroOrHmac(word, 4), zeroOrHmac(word, 5), zeroOrHmac(word, 6))
+}
+
+func separateBits(num uint32, nBits int) ([]int, []int) {
+	setBits := []int{}
+	unsetBits := []int{}
+
+	// Loop through all 32 bits
+	for i := range min(nBits, 24) {
+		// Check if the bit at position i is set to 1
+		if (num & (1 << i)) != 0 {
+			setBits = append(setBits, i)
+		} else {
+			unsetBits = append(unsetBits, i)
+		}
+	}
+
+	return setBits, unsetBits
+}
+
+func getSearchData(word string) (ones []int, zeroes []int) {
+	index := max(1, min(len(word), 6))
+	hmac := getBidxHmac(word)
+	nBits := cumulativeBitCount(index)
+	// fmtString := fmt.Sprintf("hmac: 0x%%x (0b%%%db)\n", nBits)
+	// fmt.Printf(fmtString, hmac, hmac)
+	// fmt.Printf("nBits: %d\n", nBits)
+	return separateBits(hmac, nBits)
+}
+
+func getSearchQuery(cid int, name_ones []int, name_zeroes []int) string {
+	b := strings.Builder{}
+	b.WriteString(`select 
+		p.emr_pid, 
+		p.first_name, 
+		p.last_name
+	from patients as p
+	`)
+
+	for i := range name_ones {
+		fmt.Fprintf(&b, " INNER JOIN patients_fn_bidx as fbidx_one%d ON fbidx_one%d.pid = p.id AND fbidx_one%d.cid = p.cid ", i, i, i)
+	}
+
+	for i, z := range name_zeroes {
+		fmt.Fprintf(&b, " LEFT JOIN patients_fn_bidx as fbidx_zero%d ON fbidx_zero%d.pid = p.id AND fbidx_zero%d.cid = p.cid AND fbidx_zero%d.ibit = %d ", i, i, i, i, z)
+	}
+
+	fmt.Fprintf(&b, ` WHERE p.cid = %d `, cid)
+
+	for i, o := range name_ones {
+		fmt.Fprintf(&b, " AND fbidx_one%d.ibit = %d ", i, o)
+	}
+
+	for i := range name_zeroes {
+		fmt.Fprintf(&b, " AND fbidx_zero%d.pid is null ", i)
+	}
+
+	b.WriteString(` UNION ALL
+	select 
+		p.emr_pid, 
+		p.first_name, 
+		p.last_name
+	from patients as p
+	`)
+
+	for i := range name_ones {
+		fmt.Fprintf(&b, " INNER JOIN patients_ln_bidx as lbidx_one%d ON lbidx_one%d.pid = p.id AND lbidx_one%d.cid = p.cid ", i, i, i)
+	}
+
+	for i, z := range name_zeroes {
+		fmt.Fprintf(&b, " LEFT JOIN patients_ln_bidx as lbidx_zero%d ON lbidx_zero%d.pid = p.id AND lbidx_zero%d.cid = p.cid AND lbidx_zero%d.ibit = %d ", i, i, i, i, z)
+	}
+
+	fmt.Fprintf(&b, ` WHERE p.cid = %d `, cid)
+
+	for i, o := range name_ones {
+		fmt.Fprintf(&b, " AND lbidx_one%d.ibit = %d ", i, o)
+	}
+
+	for i := range name_zeroes {
+		fmt.Fprintf(&b, " AND lbidx_zero%d.pid is null ", i)
+	}
+
+	return b.String()
+}
+
+// separateBits takes a uint32 number and returns two slices:
+// - A slice containing the positions of bits that are set to 1
+// - A slice containing the positions of bits that are set to 0
+// The bit positions are 0-indexed, with position 0 being the least significant bit
+
 type SearchResult struct {
+	emr_pid               string
 	first_name, last_name string
 	matching_letters_fn   int
 	matching_letters_ln   int
@@ -115,11 +263,7 @@ type GetUsersResponse struct {
 	Results []User `json:"results"`
 }
 
-// var lastRequest = time.Time{}
-
 var lck = sync.Mutex{}
-
-// const throttleRandomUsersSeconds = 20
 
 func getRandomUsers(amount int, _ string) ([]User, error) {
 	lck.Lock()
@@ -128,8 +272,6 @@ func getRandomUsers(amount int, _ string) ([]User, error) {
 	reader.FieldsPerRecord = 2
 	users := make([]User, amount)
 	for i := range amount {
-		// offset := reader.InputOffset()
-		// fmt.Println(offset)
 		record, err := reader.Read()
 		if err != nil {
 			return nil, err
@@ -137,221 +279,91 @@ func getRandomUsers(amount int, _ string) ([]User, error) {
 		users[i].Name = UserName{FirstName: record[0], LastName: record[1]}
 	}
 	return users, nil
-	// lck.Lock()
-	// defer lck.Unlock()
-	// sinceLast := time.Since(lastRequest)
-	// fmt.Printf("last requested users %d ago at %s\n", sinceLast, lastRequest.Format("3:04:05PM"))
-	// if sinceLast <= (throttleRandomUsersSeconds * time.Second) {
-	// 	fmt.Printf("Waiting %d seconds to make api request to respect their limits\n", (throttleRandomUsersSeconds*time.Second-sinceLast)/time.Second)
-	// 	<-time.After(throttleRandomUsersSeconds*time.Second - sinceLast)
-	// }
-	// for {
-	// 	lastRequest = time.Now()
-	// 	res, err := http.Get(fmt.Sprintf("https://randomuser.me/api?results=%d&nat=%s&inc=name&noinfo", amount, nationality))
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	defer res.Body.Close()
-	// 	decoder := json.NewDecoder(res.Body)
-	// 	usersResponse := GetUsersResponse{Results: []User{}}
-	// 	err = decoder.Decode(&usersResponse)
-	// 	if err != nil {
-	// 		return nil, err
-	// 	}
-	// 	if usersResponse.Error == "" {
-	// 		return usersResponse.Results, nil
-	// 	}
-	// 	fmt.Printf("Error while getting random users: %q. Retrying...\n", usersResponse.Error)
-	// 	<-time.After(120 * time.Second)
-	// }
+}
+
+func track(msg string) (string, time.Time) {
+	return msg, time.Now()
+}
+
+func duration(msg string, start time.Time) {
+	fmt.Printf("%v: %v\n", msg, time.Since(start))
 }
 
 func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
-	switch len(search) {
-	case 1:
-		hmac := combineHmacs(createHmac(search[:1], key1), 0, 0, 0, 0, 0)
-		fmt.Printf("hmac: 0x%x\n", hmac)
-		return db.Query(`select first_name, last_name from patients where 
-			(first_name_bidx & ?) = ? 
-			or (last_name_bidx & ?) = ?
-			LIMIT ?
-			;`,
-			bitMask(1),
-			hmac,
-			bitMask(1),
-			hmac,
-			searchLimit,
-		)
-	case 2:
-		hmac := combineHmacs(createHmac(search[:1], key1), createHmac(search[:2], key2), 0, 0, 0, 0)
-		fmt.Printf("hmac: 0x%x\n", hmac)
-		return db.Query(`select first_name, last_name from patients where 
-			(first_name_bidx & ?) = ? 
-			or (last_name_bidx & ?) = ?
-	    	LIMIT ?;`,
-			bitMask(2),
-			hmac,
-			bitMask(2),
-			hmac,
-			searchLimit,
-		)
-	case 3:
-		hmac := combineHmacs(createHmac(search[:1], key1), createHmac(search[:2], key2), createHmac(search[:3], key3), 0, 0, 0)
-		fmt.Printf("hmac: 0x%x\n", hmac)
-		return db.Query(`select first_name, last_name from patients where 
-			(first_name_bidx & ?) = ?
-			or (last_name_bidx & ?) = ?
-			LIMIT ?;`,
-			bitMask(3),
-			hmac,
-			bitMask(3),
-			hmac,
-			searchLimit,
-		)
-	case 4:
-		hmac := combineHmacs(createHmac(search[:1], key1), createHmac(search[:2], key2), createHmac(search[:3], key3), createHmac(search[:4], key4), 0, 0)
-		fmt.Printf("hmac: 0x%x\n", hmac)
-		return db.Query(`select first_name, last_name from patients where 
-			(first_name_bidx & ?) = ? 
-			or (last_name_bidx & ?) = ?
-			LIMIT ?;`,
-			bitMask(4),
-			hmac,
-			bitMask(4),
-			hmac,
-			searchLimit,
-		)
-	case 5:
-		hmac := combineHmacs(createHmac(search[:1], key1), createHmac(search[:2], key2), createHmac(search[:3], key3), createHmac(search[:4], key4), createHmac(search[:5], key5), 0)
-		fmt.Printf("hmac: 0x%x\n", hmac)
-		return db.Query(`select first_name, last_name from patients where 
-			(first_name_bidx & ?) = ? 
-			or (last_name_bidx & ?) = ?
-			LIMIT ?;`,
-			bitMask(5),
-			hmac,
-			bitMask(5),
-			hmac,
-			searchLimit,
-		)
-	default:
-		hmac := combineHmacs(createHmac(search[:1], key1), createHmac(search[:2], key2), createHmac(search[:3], key3), createHmac(search[:4], key4), createHmac(search[:5], key5), createHmac(search[:6], key6))
-		fmt.Printf("hmac: 0x%x\n", hmac)
-		return db.Query(`select first_name, last_name from patients where 
-			(first_name_bidx & ?) = ? 
-			or (last_name_bidx & ?) = ?
-			LIMIT ?;`,
-			bitMask(6),
-			hmac,
-			bitMask(6),
-			hmac,
-			searchLimit,
-		)
-		// default:
-		// 	hmac := combineHmacs(createHmac(search[:1]), createHmac(search[:2]), createHmac(search[:3]), createHmac(search[:4]), createHmac(search[:5]))
-		// 	return db.Query(`select first_name, last_name from patients where
-		// 		first_name_bidx & 0x3fffffff = ?
-		// 		or last_name_bidx & 0x3fffffff = ?
-		// 		LIMIT 1000;`,
-		// 		hmac,
-		// 		hmac,
-		// 	)
-		// default:
-		// 	searchPadded := search + "       "
-		// 	hmac1 := createHmac(search[:1])
-		// 	hmac2 := createHmac(searchPadded[:2])
-		// 	hmac3 := createHmac(searchPadded[:3])
-		// 	hmac4 := createHmac(searchPadded[:4])
-		// 	hmac5 := createHmac(searchPadded[:5])
-		// 	return db.Query(`select first_name, last_name from patients where
-		// 		(first_name_bidx1 = ? and first_name_bidx2 = ? and first_name_bidx3 = ? and first_name_bidx4 = ? and first_name_bidx5 = ?)
-		// 		or (last_name_bidx1 = ? and last_name_bidx2 = ? and last_name_bidx3 = ? and last_name_bidx4 = ? and last_name_bidx5 = ?)
-		// 		;`,
-		// 		hmac1, hmac2, hmac3, hmac4, hmac5,
-		// 		hmac1, hmac2, hmac3, hmac4, hmac5,
-		// 	)
-	}
+	ones, zeroes := getSearchData(search)
+	fmt.Printf("ones: %+v, zeroes: %+v\n", ones, zeroes)
+	defer duration(track("query time:"))
+	return db.Query(getSearchQuery(1, ones, zeroes))
 }
 
-var searchLimit int
+func explainQueryFor(db *sql.DB, search string) (*sql.Rows, error) {
+	ones, zeroes := getSearchData(search)
+	fmt.Printf("ones: %+v, zeroes: %+v\n", ones, zeroes)
+	defer duration(track("query time:"))
+	return db.Query("EXPLAIN " + getSearchQuery(1, ones, zeroes))
+}
+
+var (
+	searchLimit int
+	explain     bool
+)
 
 func main() {
+	queryPool := sync.Pool{
+		New: func() interface{} {
+			return &strings.Builder{}
+		},
+	}
+	getBuilder := func() *strings.Builder {
+		return queryPool.Get().(*strings.Builder)
+	}
+	returnBuilder := func(b *strings.Builder) {
+		b.Reset()
+		queryPool.Put(b)
+	}
 	var command string
+	ncids := 83
 	flag.StringVar(&command, "command", "search", "enter 'search', 'populate', 'stats', or 'prep'")
 	var search string
 	flag.StringVar(&search, "search", "", "enter text to search if searching")
 	var count int
 	flag.IntVar(&count, "count", 1, "enter loops of inserting")
 	flag.IntVar(&searchLimit, "limit", 1000, "enter search limit")
+	flag.BoolVar(&explain, "explain", false, "do explain")
 	flag.Parse()
 
 	db, err := sql.Open("mysql", "root:password@tcp(127.0.0.1:3306)/db")
 	if err != nil {
 		panic(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	fmt.Println(command)
 	switch command {
 	case "stats":
-		querySize := `SELECT table_name, index_name,
-stat_value * @@innodb_page_size as size_in_mb
-FROM mysql.innodb_index_stats
-WHERE stat_name = 'size'
-AND table_name = 'patients' 
-OR table_name = 'patients_comp'
-;`
-		res, err := db.Query(querySize)
+		res, err := db.Query(tableSizeQuery)
 		if err != nil {
 			panic(err)
 		}
-		patientIndexSizes := []int{}
-		patientIndexNames := []string{}
-		// patientCompIndexSizes := []int{}
-		// patientCompIndexNames := []string{}
+		tableSizes := []int{}
+		tableNames := []string{}
 		for res.Next() {
 			var tbl string
-			var index string
 			var indexSizeBytes int
-			err = res.Scan(&tbl, &index, &indexSizeBytes)
+			err = res.Scan(&tbl, &indexSizeBytes)
 			if err != nil {
 				panic(err)
 			}
-			switch tbl {
-			case "patients":
-				patientIndexNames = append(patientIndexNames, index)
-				patientIndexSizes = append(patientIndexSizes, indexSizeBytes)
-				// case "patients_comp":
-				// 	patientCompIndexNames = append(patientCompIndexNames, index)
-				// 	patientCompIndexSizes = append(patientCompIndexSizes, indexSizeBytes)
-			}
+			tableNames = append(tableNames, tbl)
+			tableSizes = append(tableSizes, indexSizeBytes)
 		}
-		fmt.Printf("Table: patients\n\t")
-		totalSize := 0
-		bidxSize := 0
 
-		for i, sizeBytes := range patientIndexSizes {
-			if patientIndexNames[i] == "PRIMARY" {
-				fmt.Printf("- Table Data:\n\t  Size: %.2f MB\n\t", float64(sizeBytes)/1024.0/1024.0)
-			} else {
-				fmt.Printf("- Index: %s\n\t  Size: %.2f MB\n\t", patientIndexNames[i], float64(sizeBytes)/1024.0/1024.0)
-				if patientIndexNames[i] != "id" {
-					bidxSize += sizeBytes
-				}
-			}
-			totalSize += sizeBytes
+		totalSize := 0
+		for i, name := range tableNames {
+			fmt.Printf("Table: %s\n\t  Size: %d MB\n\t", name, tableSizes[i])
+			totalSize += tableSizes[i]
 		}
-		sizeWithoutBidx := totalSize - bidxSize
 		fmt.Printf("---------------------------\n\t")
-		fmt.Printf("Total Size:          %.2f MB\n\t", float64(totalSize)/1024.0/1024.0)
-		fmt.Printf("Size Without bidx:   %.2f MB\n\t", float64(sizeWithoutBidx)/1024.0/1024.0)
-		fmt.Printf("Bidx Size Increase:  %.2f%s\n\n", 100*float64(totalSize-sizeWithoutBidx)/float64(totalSize), "%")
-		// fmt.Printf("Table: patients_comp\n\t")
-		// totalSize = 0
-		// for i, sizeBytes := range patientCompIndexSizes {
-		// 	fmt.Printf("- Index: %s\n\t  Size: %.2f\n\t", patientCompIndexNames[i], float64(sizeBytes)/1024.0/1024.0)
-		// 	totalSize += sizeBytes
-		// }
-		// fmt.Printf("\bTotal Size: %.2f\n\n", float64(totalSize)/1024.0/1024.0)
+		fmt.Printf("Total Size:          %d MB\n\t", totalSize)
 
 		res, err = db.Query("SELECT COUNT(*) FROM patients;")
 		if err != nil {
@@ -367,15 +379,49 @@ OR table_name = 'patients_comp'
 		}
 	case "search":
 		fmt.Printf("searching for %q\n", search)
+		if explain {
+			rows, err := explainQueryFor(db, search)
+			if err != nil {
+				panic(err)
+			}
+
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				// id select_type table partitions type possible_keys key key_len ref rows filtered Extra
+				var id, key_len, nrows, filtered sql.NullInt64
+				var selectType, table, partitions, etype, possible_keys, key, ref, extra sql.NullString
+				err := rows.Scan(&id, &selectType, &table, &partitions, &etype, &possible_keys, &key, &key_len, &ref, &nrows, &filtered, &extra)
+				if err != nil {
+					panic(err)
+				}
+				fmt.Printf(`
+- id: %d
+	select_type:   %s,
+	table:         %s
+	partitions:    %s,
+	type:          %s,
+	possible_keys: %s,
+	key:           %s,
+	key_len:       %d,
+	ref:           %s,
+	rows:          %d,
+	filtered:      %d,
+	extra:         %s,
+`, id.Int64, selectType.String, table.String, partitions.String, etype.String, possible_keys.String, key.String, key_len.Int64, ref.String, nrows.Int64, filtered.Int64, extra.String,
+				)
+			}
+			return
+		}
 		rows, err := queryFor(db, search)
 		if err != nil {
 			panic(err)
 		}
 		values := []SearchResult{}
 		valuesMatchingWholeSearch := 0
+		defer func() { _ = rows.Close() }()
 		for rows.Next() {
 			value := SearchResult{}
-			err = rows.Scan(&value.first_name, &value.last_name)
+			err = rows.Scan(&value.emr_pid, &value.first_name, &value.last_name)
 			if err != nil {
 				panic(err)
 			}
@@ -439,7 +485,7 @@ OR table_name = 'patients_comp'
 		topSliceSize := min(10, len(topWordsSlice))
 		topWords := []string{}
 		for _, w := range topWordsSlice[:topSliceSize] {
-			topWords = append(topWords, fmt.Sprintf(`- %s %s (%d/%d, %d/%d)`, w.first_name, w.last_name, w.matching_letters_fn, len(w.first_name), w.matching_letters_ln, len(w.last_name)))
+			topWords = append(topWords, fmt.Sprintf(`- %s %s %s (%d/%d, %d/%d)`, w.emr_pid, w.first_name, w.last_name, w.matching_letters_fn, len(w.first_name), w.matching_letters_ln, len(w.last_name)))
 			// topWords = append(topWords, fmt.Sprintf(`- %s %s -- match: %d, lenMatchWord: %d, diff: %d`, w.first_name, w.last_name, w.match, w.matchWordLen, w.matchWordLen-w.match))
 		}
 
@@ -456,36 +502,45 @@ OR table_name = 'patients_comp'
 
 	case "prep":
 		// drop by default
-		_, _ = db.Exec("drop table patients;")
-		_, _ = db.Exec("drop table patients_comp;")
+		_, _ = db.Exec("drop table if exists patients_automerge;")
+		_, _ = db.Exec("drop table if exists patients_fn_bidx;")
+		_, _ = db.Exec("drop table if exists patients_ln_bidx;")
+		_, _ = db.Exec("drop table if exists patients;")
+		_, _ = db.Exec("drop table if exists customers;")
 		// populate db
-		_, err = db.Exec(`create table patients (
-						  id SERIAL PRIMARY KEY,
-						  first_name VARCHAR(64) NOT NULL,
-						  first_name_bidx MEDIUMINT UNSIGNED NOT NULL,
-						  last_name VARCHAR(64) NOT NULL,
-						  last_name_bidx MEDIUMINT UNSIGNED NOT NULL,
-						  INDEX (first_name_bidx),
-						  INDEX (last_name_bidx)
-						);`,
-		)
+		_, err = db.Exec(createCustomersTableSQL)
 		if err != nil {
 			panic(err)
 		}
-		// _, err = db.Exec(`create table patients_comp (
-		// 				  id SERIAL PRIMARY KEY,
-		// 				  first_name_cmp VARCHAR(100) NOT NULL,
-		// 				  last_name_cmp VARCHAR(100) NOT NULL
-		// 				);`,
-		// )
-		// if err != nil {
-		// 	panic(err)
-		// }
+		for i := range ncids {
+			_, err = db.Exec("insert into customers (id) values (?);", i+1)
+			if err != nil {
+				panic(err)
+			}
+		}
+
+		_, err = db.Exec(createPatientsTableSQL)
+		if err != nil {
+			panic(err)
+		}
+		_, err = db.Exec(createFnIndexTableSQL)
+		if err != nil {
+			panic(err)
+		}
+		_, err = db.Exec(createLnIndexTableSQL)
+		if err != nil {
+			panic(err)
+		}
+		_, err = db.Exec(createAutomergeTableSQL)
+		if err != nil {
+			panic(err)
+		}
 	case "populate":
-		chunkSize := 10000
+		currentPatient := 1
+		chunkSize := 1000
 		usersPerCount := 1000000
 		affectedRows := 0
-		affectedCh := make(chan int64, 1000)
+		affectedCh := make(chan int64, chunkSize)
 		doneWithPopulateCh := make(chan any)
 		go func() {
 			for affected := range affectedCh {
@@ -495,9 +550,15 @@ OR table_name = 'patients_comp'
 			doneWithPopulateCh <- nil
 		}()
 		wg := sync.WaitGroup{}
-		lck := make(chan byte, 20)
-		for range 20 {
-			lck <- 0
+		parallelConnections := 10
+		connlck := make(chan byte, parallelConnections)
+		for range parallelConnections {
+			connlck <- 0
+		}
+		parallelConnectionPreps := 10
+		preplck := make(chan byte, parallelConnectionPreps)
+		for range parallelConnectionPreps {
+			preplck <- 0
 		}
 		for range count {
 			wg.Add(usersPerCount / chunkSize)
@@ -511,72 +572,139 @@ OR table_name = 'patients_comp'
 				usersChunked = append(usersChunked, randomUsers[i*chunkSize:(i+1)*chunkSize])
 			}
 			for _, users := range usersChunked {
+				<-preplck
 
-				nQueryParams := 4
-				queryParams := make([]interface{}, chunkSize*nQueryParams)
-				// nCompQueryParams := 2
-				// compQueryParams := make([]interface{}, chunkSize*nCompQueryParams)
-				// patientsCompQuery := `insert into patients_comp (
-				// first_name,
-				// last_name)
-				// values `
-				patientsQuery := `insert into patients (
+				nPatientQueryParams := 6
+				nAutomergeQueryParams := 4
+				patientsQueryParams := make([]any, chunkSize*nPatientQueryParams)
+				fnQueryParams := []any{}
+				lnQueryParams := []any{}
+				automergeQueryParams := make([]any, chunkSize*nAutomergeQueryParams)
+
+				insertPatientsW := getBuilder()
+				insertPatientsW.WriteString(`insert into patients (
+				cid,
+				emr_pid,
+				dob,
+				email,
 				first_name,
-				first_name_bidx,
-				last_name,
-				last_name_bidx
+				last_name
 				)
-				values `
+				values `)
+
+				insertPatientsFnBidxW := getBuilder()
+				insertPatientsFnBidxW.WriteString(`insert into patients_fn_bidx (
+				pid,
+				cid,
+				ibit
+				)
+				values `)
+				insertPatientsLnBidxW := getBuilder()
+				insertPatientsLnBidxW.WriteString(`insert into patients_ln_bidx (
+				pid,
+				cid,
+				ibit
+				)
+				values `)
+				insertPatientsAutomergeW := getBuilder()
+				insertPatientsAutomergeW.WriteString(`insert into patients_automerge (
+				pid,
+				cid,
+				automerge_full_name_dob,
+				automerge_email_dob
+				)
+				values `)
 
 				for i, user := range users {
-					// patientsCompQuery += `(?,?),`
-					// compQueryParams[i*nCompQueryParams+0] = user.Name.FirstName
-					// compQueryParams[i*nCompQueryParams+1] = user.Name.LastName
+
+					fmt.Fprintf(insertPatientsW, `(?,?,?,?,?,?),`)
+					patient_emr_pid := fmt.Sprintf("emr_id_%d", i)
+					patient_cid := (i % ncids) + 1 // n customers, spread the data out
+					patient_email := fmt.Sprintf("%s.%s@mail.test", user.Name.FirstName, user.Name.LastName)
+					patient_dob := time.Now().UTC().Add(-time.Hour * 24 * time.Duration(currentPatient%365)).Format("2006-01-02")
+					patientsQueryParams[i*nPatientQueryParams+0] = patient_cid
+					patientsQueryParams[i*nPatientQueryParams+1] = patient_emr_pid
+					patientsQueryParams[i*nPatientQueryParams+2] = patient_dob
+					patientsQueryParams[i*nPatientQueryParams+3] = patient_email
+					patientsQueryParams[i*nPatientQueryParams+4] = user.Name.FirstName
+					patientsQueryParams[i*nPatientQueryParams+5] = user.Name.LastName
+
+					fmt.Fprintf(insertPatientsAutomergeW, `(?,?,?,?),`)
+					hashName := sha256.New().Sum([]byte(user.Name.FirstName + user.Name.LastName + patient_dob))
+					hashEmail := sha256.New().Sum([]byte(patient_email + patient_dob))
+					automergeQueryParams[i*nAutomergeQueryParams+0] = currentPatient
+					automergeQueryParams[i*nAutomergeQueryParams+1] = patient_cid
+					automergeQueryParams[i*nAutomergeQueryParams+2] = hashName[:32]
+					automergeQueryParams[i*nAutomergeQueryParams+3] = hashEmail[:32]
 
 					lowerFirstNamePadded := strings.ToLower(user.Name.FirstName) + "        "
-					lowerLastNamePadded := strings.ToLower(user.Name.LastName) + "        "
-					firstNameHmac1 := createHmac(lowerFirstNamePadded[:1], key1)
-					firstNameHmac2 := createHmac(lowerFirstNamePadded[:2], key2)
-					firstNameHmac3 := createHmac(lowerFirstNamePadded[:3], key3)
-					firstNameHmac4 := createHmac(lowerFirstNamePadded[:4], key4)
-					firstNameHmac5 := createHmac(lowerFirstNamePadded[:5], key5)
-					firstNameHmac6 := createHmac(lowerFirstNamePadded[:6], key6)
-					lastNameHmac1 := createHmac(lowerLastNamePadded[:1], key1)
-					lastNameHmac2 := createHmac(lowerLastNamePadded[:2], key2)
-					lastNameHmac3 := createHmac(lowerLastNamePadded[:3], key3)
-					lastNameHmac4 := createHmac(lowerLastNamePadded[:4], key4)
-					lastNameHmac5 := createHmac(lowerLastNamePadded[:5], key5)
-					lastNameHmac6 := createHmac(lowerLastNamePadded[:6], key6)
-					patientsQuery += `(?,?,?,?),`
-					queryParams[i*nQueryParams+0] = user.Name.FirstName
-					queryParams[i*nQueryParams+1] = combineHmacs(firstNameHmac1, firstNameHmac2, firstNameHmac3, firstNameHmac4, firstNameHmac5, firstNameHmac6)
-					// queryParams[i*nQueryParams+2] = firstNameHmac2
-					// queryParams[i*nQueryParams+3] = firstNameHmac3
-					// queryParams[i*nQueryParams+4] = firstNameHmac4
-					queryParams[i*nQueryParams+2] = user.Name.LastName
-					queryParams[i*nQueryParams+3] = combineHmacs(lastNameHmac1, lastNameHmac2, lastNameHmac3, lastNameHmac4, lastNameHmac5, lastNameHmac6)
-					// queryParams[i*nQueryParams+7] = lastNameHmac2
-					// queryParams[i*nQueryParams+8] = lastNameHmac3
-					// queryParams[i*nQueryParams+9] = lastNameHmac4
-				}
-				// patientsCompQuery = patientsCompQuery[0 : len(patientsCompQuery)-1]
-				patientsQuery = patientsQuery[0 : len(patientsQuery)-1]
+					firstNameHmacSetBits, _ := getSearchData(lowerFirstNamePadded)
+					for _, bit := range firstNameHmacSetBits {
+						insertPatientsFnBidxW.WriteString(`(?,?,?),`)
+						fnQueryParams = append(fnQueryParams, currentPatient)
+						fnQueryParams = append(fnQueryParams, patient_cid)
+						fnQueryParams = append(fnQueryParams, bit)
+					}
 
+					lowerLastNamePadded := strings.ToLower(user.Name.LastName) + "        "
+					lastNameHmacSetBits, _ := getSearchData(lowerLastNamePadded)
+					for _, bit := range lastNameHmacSetBits {
+						insertPatientsLnBidxW.WriteString(`(?,?,?),`)
+						lnQueryParams = append(lnQueryParams, currentPatient)
+						lnQueryParams = append(lnQueryParams, patient_cid)
+						lnQueryParams = append(lnQueryParams, bit)
+					}
+
+					currentPatient++
+				}
+				patientsQuery := insertPatientsW.String()
+				patientsQuery = patientsQuery[0 : len(patientsQuery)-1]
+				returnBuilder(insertPatientsW)
+
+				patientsAutomergeQuery := insertPatientsAutomergeW.String()
+				patientsAutomergeQuery = patientsAutomergeQuery[0 : len(patientsAutomergeQuery)-1]
+				returnBuilder(insertPatientsAutomergeW)
+
+				patientsLnBidxQuery := insertPatientsLnBidxW.String()
+				patientsLnBidxQuery = patientsLnBidxQuery[0 : len(patientsLnBidxQuery)-1]
+				returnBuilder(insertPatientsLnBidxW)
+
+				patientsFnBidxQuery := insertPatientsFnBidxW.String()
+				patientsFnBidxQuery = patientsFnBidxQuery[0 : len(patientsFnBidxQuery)-1]
+				returnBuilder(insertPatientsFnBidxW)
 				go func() {
-					<-lck
-					// _, cerr := db.Exec(patientsCompQuery, compQueryParams...)
-					// if cerr != nil {
-					// 	panic(cerr)
-					// }
-					res, cerr := db.Exec(patientsQuery, queryParams...)
+					<-connlck
+					res, cerr := db.Exec(patientsQuery, patientsQueryParams...)
 					if cerr != nil {
 						panic(cerr)
 					}
-
 					row, _ := res.RowsAffected()
 					affectedCh <- row
+
+					_, cerr = db.Exec(patientsAutomergeQuery, automergeQueryParams...)
+					if cerr != nil {
+						panic(cerr)
+					}
+					// row, _ = res.RowsAffected()
+					// affectedCh <- row
+
+					_, cerr = db.Exec(patientsLnBidxQuery, lnQueryParams...)
+					if cerr != nil {
+						panic(cerr)
+					}
+					// row, _ = res.RowsAffected()
+					// affectedCh <- row
+
+					_, cerr = db.Exec(patientsFnBidxQuery, fnQueryParams...)
+					if cerr != nil {
+						panic(cerr)
+					}
+					// row, _ = res.RowsAffected()
+					// affectedCh <- row
+
 					wg.Done()
-					lck <- 0
+					connlck <- 0
+					preplck <- 0
 				}()
 			}
 			wg.Wait()
