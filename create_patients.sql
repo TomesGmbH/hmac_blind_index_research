@@ -1,9 +1,11 @@
 CREATE TABLE patients (
 -- plaintext
-    id INT UNSIGNED AUTO_INCREMENT,
-    cid INT NOT NULL,
+    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY, 
+    cid INT UNSIGNED NOT NULL,
     emr_pid VARCHAR(50) NOT NULL,
     gender ENUM('male','female','unknown','other') default 'unknown' NOT NULL,
+    bidx_fn mediumint unsigned not null,
+    bidx_ln mediumint unsigned not null,
 
 -- cle
     dob DATE NOT NULL,
@@ -35,13 +37,15 @@ CREATE TABLE patients (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
-    PRIMARY KEY (id),
+    index idx_patient_cid_fn_lnbidx (cid, bidx_fn, bidx_ln),
 
--- Basic indexes for performance
--- for listing patients
+
+    -- Basic indexes for performance
+    -- for listing patients
     INDEX idx_patients_cid (cid),
--- for updating patient data from the EMR
-    INDEX idx_patients_cid_emr_pid (cid, emr_pid),
+
+    -- for updating patient data from the EMR
+    unique INDEX idx_patients_cid_emr_pid (cid, emr_pid),
 
     CONSTRAINT fk_patients_cid FOREIGN KEY (cid) REFERENCES customers (id) ON DELETE CASCADE ON UPDATE CASCADE
 );

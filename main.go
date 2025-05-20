@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/csv"
+	"encoding/hex"
 	"flag"
 	"fmt"
-	"slices"
+	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -24,11 +26,14 @@ var createCustomersTableSQL string
 //go:embed create_patients.sql
 var createPatientsTableSQL string
 
-//go:embed create_fn_index.sql
-var createFnIndexTableSQL string
+//go:embed create_old_index.sql
+var createOldIndexTableSQL string
 
-//go:embed create_ln_index.sql
-var createLnIndexTableSQL string
+//go:embed create_split_index.sql
+var createSplitIndexTableSQL string
+
+//go:embed create_split_unified_index.sql
+var createSplitUnifiedIndexTableSQL string
 
 //go:embed create_automerge.sql
 var createAutomergeTableSQL string
@@ -87,24 +92,6 @@ func bitCount(letterCount int) uint32 {
 	return 0
 }
 
-func cumulativeBitCount(letterCount int) int {
-	switch truncLetterCount(letterCount) {
-	case 1:
-		return 7
-	case 2:
-		return 7 + 6
-	case 3:
-		return 7 + 6 + 5
-	case 4:
-		return 7 + 6 + 5 + 2
-	case 5:
-		return 7 + 6 + 5 + 2 + 2
-	case 6:
-		return 7 + 6 + 5 + 2 + 2 + 2
-	}
-	return 0
-}
-
 func bitShift(letterCount int) uint32 {
 	shift := uint32(0)
 	for i := range truncLetterCount(letterCount) {
@@ -154,101 +141,12 @@ func getBidxHmac(word string) uint32 {
 	return combineHmacs(zeroOrHmac(word, 1), zeroOrHmac(word, 2), zeroOrHmac(word, 3), zeroOrHmac(word, 4), zeroOrHmac(word, 5), zeroOrHmac(word, 6))
 }
 
-func separateBits(num uint32, nBits int) ([]int, []int) {
-	setBits := []int{}
-	unsetBits := []int{}
-
-	// Loop through all 32 bits
-	for i := range min(nBits, 24) {
-		// Check if the bit at position i is set to 1
-		if (num & (1 << i)) != 0 {
-			setBits = append(setBits, i)
-		} else {
-			unsetBits = append(unsetBits, i)
-		}
+func bitMask(letterCount int) uint32 {
+	bitMask := uint32(0)
+	for i := range truncLetterCount(letterCount) {
+		bitMask = bitMask | bitPattern(i+1)<<bitShift(i+1)
 	}
-
-	return setBits, unsetBits
-}
-
-func getSearchData(word string) (ones []int, zeroes []int) {
-	index := max(1, min(len(word), 6))
-	hmac := getBidxHmac(word)
-	nBits := cumulativeBitCount(index)
-	// fmtString := fmt.Sprintf("hmac: 0x%%x (0b%%%db)\n", nBits)
-	// fmt.Printf(fmtString, hmac, hmac)
-	// fmt.Printf("nBits: %d\n", nBits)
-	return separateBits(hmac, nBits)
-}
-
-func getSearchQuery(cid int, name_ones []int, name_zeroes []int) string {
-	b := strings.Builder{}
-	b.WriteString(`select 
-		p.emr_pid, 
-		p.first_name, 
-		p.last_name
-	from patients as p
-	`)
-
-	for i := range name_ones {
-		fmt.Fprintf(&b, " INNER JOIN patients_fn_bidx as fbidx_one%d ON fbidx_one%d.pid = p.id AND fbidx_one%d.cid = p.cid ", i, i, i)
-	}
-
-	for i, z := range name_zeroes {
-		fmt.Fprintf(&b, " LEFT JOIN patients_fn_bidx as fbidx_zero%d ON fbidx_zero%d.pid = p.id AND fbidx_zero%d.cid = p.cid AND fbidx_zero%d.ibit = %d ", i, i, i, i, z)
-	}
-
-	fmt.Fprintf(&b, ` WHERE p.cid = %d `, cid)
-
-	for i, o := range name_ones {
-		fmt.Fprintf(&b, " AND fbidx_one%d.ibit = %d ", i, o)
-	}
-
-	for i := range name_zeroes {
-		fmt.Fprintf(&b, " AND fbidx_zero%d.pid is null ", i)
-	}
-
-	b.WriteString(` UNION ALL
-	select 
-		p.emr_pid, 
-		p.first_name, 
-		p.last_name
-	from patients as p
-	`)
-
-	for i := range name_ones {
-		fmt.Fprintf(&b, " INNER JOIN patients_ln_bidx as lbidx_one%d ON lbidx_one%d.pid = p.id AND lbidx_one%d.cid = p.cid ", i, i, i)
-	}
-
-	for i, z := range name_zeroes {
-		fmt.Fprintf(&b, " LEFT JOIN patients_ln_bidx as lbidx_zero%d ON lbidx_zero%d.pid = p.id AND lbidx_zero%d.cid = p.cid AND lbidx_zero%d.ibit = %d ", i, i, i, i, z)
-	}
-
-	fmt.Fprintf(&b, ` WHERE p.cid = %d `, cid)
-
-	for i, o := range name_ones {
-		fmt.Fprintf(&b, " AND lbidx_one%d.ibit = %d ", i, o)
-	}
-
-	for i := range name_zeroes {
-		fmt.Fprintf(&b, " AND lbidx_zero%d.pid is null ", i)
-	}
-
-	return b.String()
-}
-
-// separateBits takes a uint32 number and returns two slices:
-// - A slice containing the positions of bits that are set to 1
-// - A slice containing the positions of bits that are set to 0
-// The bit positions are 0-indexed, with position 0 being the least significant bit
-
-type SearchResult struct {
-	emr_pid               string
-	first_name, last_name string
-	matching_letters_fn   int
-	matching_letters_ln   int
-	match                 int
-	matchWordLen          int
+	return bitMask
 }
 
 type UserName struct {
@@ -281,55 +179,28 @@ func getRandomUsers(amount int, _ string) ([]User, error) {
 	return users, nil
 }
 
-func track(msg string) (string, time.Time) {
-	return msg, time.Now()
+func doChunked[T any](values []T, chunkSize int, f func(startIndex int, chunk []T) error) {
+	total := len(values)
+	valuesChunked := [][]T{}
+	for i := range total / chunkSize {
+		valuesChunked = append(valuesChunked, values[i*chunkSize:min((i+1)*chunkSize, total)])
+	}
+	for i, chunk := range valuesChunked {
+		log.Printf("Handling chunk %d/%d\n", i+1, len(valuesChunked))
+		err := f(i*chunkSize, chunk)
+		if err != nil {
+			panic(err)
+		}
+		log.Printf("Done with %d/%d\n", min((i+1)*chunkSize, total), total)
+	}
 }
-
-func duration(msg string, start time.Time) {
-	fmt.Printf("%v: %v\n", msg, time.Since(start))
-}
-
-func queryFor(db *sql.DB, search string) (*sql.Rows, error) {
-	ones, zeroes := getSearchData(search)
-	fmt.Printf("ones: %+v, zeroes: %+v\n", ones, zeroes)
-	defer duration(track("query time:"))
-	return db.Query(getSearchQuery(1, ones, zeroes))
-}
-
-func explainQueryFor(db *sql.DB, search string) (*sql.Rows, error) {
-	ones, zeroes := getSearchData(search)
-	fmt.Printf("ones: %+v, zeroes: %+v\n", ones, zeroes)
-	defer duration(track("query time:"))
-	return db.Query("EXPLAIN " + getSearchQuery(1, ones, zeroes))
-}
-
-var (
-	searchLimit int
-	explain     bool
-)
 
 func main() {
-	queryPool := sync.Pool{
-		New: func() interface{} {
-			return &strings.Builder{}
-		},
-	}
-	getBuilder := func() *strings.Builder {
-		return queryPool.Get().(*strings.Builder)
-	}
-	returnBuilder := func(b *strings.Builder) {
-		b.Reset()
-		queryPool.Put(b)
-	}
 	var command string
-	ncids := 83
+	ncids := 10
 	flag.StringVar(&command, "command", "search", "enter 'search', 'populate', 'stats', or 'prep'")
 	var search string
 	flag.StringVar(&search, "search", "", "enter text to search if searching")
-	var count int
-	flag.IntVar(&count, "count", 1, "enter loops of inserting")
-	flag.IntVar(&searchLimit, "limit", 1000, "enter search limit")
-	flag.BoolVar(&explain, "explain", false, "do explain")
 	flag.Parse()
 
 	db, err := sql.Open("mysql", "root:password@tcp(127.0.0.1:3306)/db")
@@ -344,26 +215,26 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		tableSizes := []int{}
+		tableSizes := []float64{}
 		tableNames := []string{}
 		for res.Next() {
 			var tbl string
-			var indexSizeBytes int
-			err = res.Scan(&tbl, &indexSizeBytes)
+			var indexSizeMB float64
+			err = res.Scan(&tbl, &indexSizeMB)
 			if err != nil {
 				panic(err)
 			}
 			tableNames = append(tableNames, tbl)
-			tableSizes = append(tableSizes, indexSizeBytes)
+			tableSizes = append(tableSizes, indexSizeMB)
 		}
 
-		totalSize := 0
+		totalSize := 0.0
 		for i, name := range tableNames {
-			fmt.Printf("Table: %s\n\t  Size: %d MB\n\t", name, tableSizes[i])
+			fmt.Printf("Table: %s\n\t  Size: %f MB\n\t", name, tableSizes[i])
 			totalSize += tableSizes[i]
 		}
 		fmt.Printf("---------------------------\n\t")
-		fmt.Printf("Total Size:          %d MB\n\t", totalSize)
+		fmt.Printf("Total Size:          %f MB\n\t", totalSize)
 
 		res, err = db.Query("SELECT COUNT(*) FROM patients;")
 		if err != nil {
@@ -378,137 +249,51 @@ func main() {
 			fmt.Printf("Total patients: %d\n", rows)
 		}
 	case "search":
-		fmt.Printf("searching for %q\n", search)
-		if explain {
-			rows, err := explainQueryFor(db, search)
-			if err != nil {
-				panic(err)
-			}
-
-			defer func() { _ = rows.Close() }()
-			for rows.Next() {
-				// id select_type table partitions type possible_keys key key_len ref rows filtered Extra
-				var id, key_len, nrows, filtered sql.NullInt64
-				var selectType, table, partitions, etype, possible_keys, key, ref, extra sql.NullString
-				err := rows.Scan(&id, &selectType, &table, &partitions, &etype, &possible_keys, &key, &key_len, &ref, &nrows, &filtered, &extra)
-				if err != nil {
-					panic(err)
-				}
-				fmt.Printf(`
-- id: %d
-	select_type:   %s,
-	table:         %s
-	partitions:    %s,
-	type:          %s,
-	possible_keys: %s,
-	key:           %s,
-	key_len:       %d,
-	ref:           %s,
-	rows:          %d,
-	filtered:      %d,
-	extra:         %s,
-`, id.Int64, selectType.String, table.String, partitions.String, etype.String, possible_keys.String, key.String, key_len.Int64, ref.String, nrows.Int64, filtered.Int64, extra.String,
-				)
-			}
-			return
-		}
-		rows, err := queryFor(db, search)
-		if err != nil {
-			panic(err)
-		}
-		values := []SearchResult{}
-		valuesMatchingWholeSearch := 0
-		defer func() { _ = rows.Close() }()
-		for rows.Next() {
-			value := SearchResult{}
-			err = rows.Scan(&value.emr_pid, &value.first_name, &value.last_name)
-			if err != nil {
-				panic(err)
-			}
-			firstNameLower := strings.ToLower(value.first_name)
-			lastNameLower := strings.ToLower(value.last_name)
-			searchLower := strings.ToLower(search)
-			checkFirstName := true
-			checkLastName := true
-			value.matching_letters_fn = 0
-			value.matching_letters_ln = 0
-			for i := range searchLower {
-				if checkFirstName && len(firstNameLower) > i {
-					if firstNameLower[i] == searchLower[i] {
-						value.matching_letters_fn++
-					} else {
-						checkFirstName = false
-					}
-				}
-				if checkLastName && len(lastNameLower) > i {
-					if lastNameLower[i] == searchLower[i] {
-						value.matching_letters_ln++
-					} else {
-						checkLastName = false
-					}
-				}
-			}
-			if value.matching_letters_fn > value.matching_letters_ln {
-				value.match = value.matching_letters_fn
-				value.matchWordLen = len([]byte(value.first_name))
-			} else {
-				value.match = value.matching_letters_ln
-				value.matchWordLen = len([]byte(value.last_name))
-			}
-
-			if value.match == len(search) {
-				valuesMatchingWholeSearch++
-			}
-			values = append(values, value)
-		}
-		if err != nil {
-			panic(err)
-		}
-		avgMatch := 0.0
-		matchSum := 0
-		avgMatchWordLen := 0.0
-		matchWordLenSum := 0
-		avgMatchWordLenDiff := 0.0
-		matchWordLenDiffSum := 0
-		for _, v := range values {
-			matchSum += v.match
-			matchWordLenSum += v.matchWordLen
-			matchWordLenDiffSum += v.matchWordLen - v.match
-		}
-		avgMatch = float64(matchSum) / float64(len(values))
-		avgMatchWordLen = float64(matchWordLenSum) / float64(len(values))
-		avgMatchWordLenDiff = float64(matchWordLenDiffSum) / float64(len(values))
-		topWordsSlice := slices.Clone(values)
-		slices.SortFunc(topWordsSlice, func(i, j SearchResult) int {
-			return (2*(2*j.match-len(search)) - min(j.matching_letters_fn, j.matching_letters_ln)) - (2*(2*i.match-len(search)) - min(i.matching_letters_fn, i.matching_letters_ln))
-		})
-		topSliceSize := min(10, len(topWordsSlice))
-		topWords := []string{}
-		for _, w := range topWordsSlice[:topSliceSize] {
-			topWords = append(topWords, fmt.Sprintf(`- %s %s %s (%d/%d, %d/%d)`, w.emr_pid, w.first_name, w.last_name, w.matching_letters_fn, len(w.first_name), w.matching_letters_ln, len(w.last_name)))
-			// topWords = append(topWords, fmt.Sprintf(`- %s %s -- match: %d, lenMatchWord: %d, diff: %d`, w.first_name, w.last_name, w.match, w.matchWordLen, w.matchWordLen-w.match))
-		}
-
-		fmt.Printf(
-			"Total matches: %d\nMatches matching whole search: %d\nAverage matching prefix length: %f\nAverage matching word length: %f\nAverage matching word length - matching prefix: %f\nTop %d words:\n%s\n",
-			len(values),
-			valuesMatchingWholeSearch,
-			avgMatch,
-			avgMatchWordLen,
-			avgMatchWordLenDiff,
-			topSliceSize,
-			strings.Join(topWords, "\n"),
-		)
+		fmt.Printf("search parameters for %q\n", search)
+		hmac := getBidxHmac(search)
+		fmt.Printf("Bit Mask as decimal: %d\n", bitMask(len(search)))
+		fmt.Printf("Blind Index HMAC for %s (%d letters): %d (0x%x)\n", search, min(len(search), 6), hmac, hmac)
 
 	case "prep":
 		// drop by default
-		_, _ = db.Exec("drop table if exists patients_automerge;")
-		_, _ = db.Exec("drop table if exists patients_fn_bidx;")
-		_, _ = db.Exec("drop table if exists patients_ln_bidx;")
-		_, _ = db.Exec("drop table if exists patients;")
-		_, _ = db.Exec("drop table if exists customers;")
+		log.Println("started")
+		_, err = db.Exec("drop table if exists patients_automerge;")
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = db.Exec("drop table if exists patients_bidx;")
+		if err != nil {
+			panic(err)
+		}
+		log.Println("dropped patients_bidx")
+
+		_, err = db.Exec("drop table if exists patients_bidx_split;")
+		if err != nil {
+			panic(err)
+		}
+		log.Println("dropped patients_bidx_split")
+
+		_, err = db.Exec("drop table if exists patients_bidx_split_unified;")
+		if err != nil {
+			panic(err)
+		}
+		log.Println("dropped patients_bidx_split_unified")
+
+		_, err = db.Exec("drop table if exists patients;")
+		if err != nil {
+			panic(err)
+		}
+		log.Println("dropped patients")
+		_, err = db.Exec("drop table if exists customers;")
+		if err != nil {
+			panic(err)
+		}
+		log.Println("dropped customers")
+
 		// populate db
 		_, err = db.Exec(createCustomersTableSQL)
+		log.Println("created customers table")
 		if err != nil {
 			panic(err)
 		}
@@ -518,199 +303,277 @@ func main() {
 				panic(err)
 			}
 		}
+		log.Println("created customers")
 
 		_, err = db.Exec(createPatientsTableSQL)
 		if err != nil {
 			panic(err)
 		}
-		_, err = db.Exec(createFnIndexTableSQL)
+		log.Println("created patients")
+
+		_, err = db.Exec(createOldIndexTableSQL)
 		if err != nil {
 			panic(err)
 		}
-		_, err = db.Exec(createLnIndexTableSQL)
+		log.Println("created old index")
+
+		_, err = db.Exec(createSplitIndexTableSQL)
 		if err != nil {
 			panic(err)
 		}
+		log.Println("created split index")
+
+		_, err = db.Exec(createSplitUnifiedIndexTableSQL)
+		if err != nil {
+			panic(err)
+		}
+		log.Println("created split unified index")
 		_, err = db.Exec(createAutomergeTableSQL)
 		if err != nil {
 			panic(err)
 		}
+		log.Println("created automerge")
 	case "populate":
-		currentPatient := 1
-		chunkSize := 1000
 		usersPerCount := 1000000
-		affectedRows := 0
-		affectedCh := make(chan int64, chunkSize)
-		doneWithPopulateCh := make(chan any)
-		go func() {
-			for affected := range affectedCh {
-				affectedRows += int(affected)
-				fmt.Printf("done %d/%d...\n", affectedRows, count*usersPerCount)
-			}
-			doneWithPopulateCh <- nil
-		}()
-		wg := sync.WaitGroup{}
-		parallelConnections := 10
-		connlck := make(chan byte, parallelConnections)
-		for range parallelConnections {
-			connlck <- 0
+		startOffset := 1000000
+		randomUsers, err := getRandomUsers(usersPerCount, "de")
+		if err != nil {
+			panic(err)
 		}
-		parallelConnectionPreps := 10
-		preplck := make(chan byte, parallelConnectionPreps)
-		for range parallelConnectionPreps {
-			preplck <- 0
-		}
-		for range count {
-			wg.Add(usersPerCount / chunkSize)
-			randomUsers, err := getRandomUsers(usersPerCount, "de")
+		fmt.Printf("got %d random users...\n", len(randomUsers))
+		doChunked(randomUsers, 100000, func(startIndex int, randomUsers []User) error {
+			startIndex = startIndex + startOffset
+			f, err := os.OpenFile(fmt.Sprintf("./setup_%d.sql", startIndex), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			defer func() {
+				if err := f.Close(); err != nil {
+					panic(err)
+				}
+			}()
 			if err != nil {
 				panic(err)
 			}
-			fmt.Printf("got %d random users...\n", len(randomUsers))
-			usersChunked := [][]User{}
-			for i := range usersPerCount / chunkSize {
-				usersChunked = append(usersChunked, randomUsers[i*chunkSize:(i+1)*chunkSize])
-			}
-			for _, users := range usersChunked {
-				<-preplck
-
-				nPatientQueryParams := 6
-				nAutomergeQueryParams := 4
-				patientsQueryParams := make([]any, chunkSize*nPatientQueryParams)
-				fnQueryParams := []any{}
-				lnQueryParams := []any{}
-				automergeQueryParams := make([]any, chunkSize*nAutomergeQueryParams)
-
-				insertPatientsW := getBuilder()
-				insertPatientsW.WriteString(`insert into patients (
+			log.Println("creating insert statements")
+			_, _ = fmt.Fprint(f, `insert into patients (
 				cid,
 				emr_pid,
 				dob,
 				email,
 				first_name,
-				last_name
+				last_name,
+				bidx_fn,
+				bidx_ln
 				)
 				values `)
+			for i_pre_add, user := range randomUsers {
+				i := i_pre_add + startIndex + 1
 
-				insertPatientsFnBidxW := getBuilder()
-				insertPatientsFnBidxW.WriteString(`insert into patients_fn_bidx (
-				pid,
-				cid,
-				ibit
+				patient_emr_pid := fmt.Sprintf("emr_id_%d", i)
+				patient_cid := (i % ncids) + 1 // n customers, spread the data out
+				patient_email := fmt.Sprintf("%s.%s@mail.test", user.Name.FirstName, user.Name.LastName)
+				patient_dob := time.Now().UTC().Add(-time.Hour * 24 * time.Duration(i%365)).Format("2006-01-02")
+				lowerLastNamePadded := strings.ToLower(user.Name.LastName) + "        "
+				lowerFirstNamePadded := strings.ToLower(user.Name.FirstName) + "        "
+				fnhmac := getBidxHmac(lowerFirstNamePadded)
+				lnhmac := getBidxHmac(lowerLastNamePadded)
+				_, _ = fmt.Fprintf(f, `(%d,%q,%q,%q,%q,%q,%d,%d)`,
+					patient_cid,
+					patient_emr_pid,
+					patient_dob,
+					patient_email,
+					user.Name.FirstName,
+					user.Name.LastName,
+					fnhmac,
+					lnhmac,
 				)
-				values `)
-				insertPatientsLnBidxW := getBuilder()
-				insertPatientsLnBidxW.WriteString(`insert into patients_ln_bidx (
-				pid,
-				cid,
-				ibit
-				)
-				values `)
-				insertPatientsAutomergeW := getBuilder()
-				insertPatientsAutomergeW.WriteString(`insert into patients_automerge (
-				pid,
-				cid,
-				automerge_full_name_dob,
-				automerge_email_dob
-				)
-				values `)
-
-				for i, user := range users {
-
-					fmt.Fprintf(insertPatientsW, `(?,?,?,?,?,?),`)
-					patient_emr_pid := fmt.Sprintf("emr_id_%d", i)
-					patient_cid := (i % ncids) + 1 // n customers, spread the data out
-					patient_email := fmt.Sprintf("%s.%s@mail.test", user.Name.FirstName, user.Name.LastName)
-					patient_dob := time.Now().UTC().Add(-time.Hour * 24 * time.Duration(currentPatient%365)).Format("2006-01-02")
-					patientsQueryParams[i*nPatientQueryParams+0] = patient_cid
-					patientsQueryParams[i*nPatientQueryParams+1] = patient_emr_pid
-					patientsQueryParams[i*nPatientQueryParams+2] = patient_dob
-					patientsQueryParams[i*nPatientQueryParams+3] = patient_email
-					patientsQueryParams[i*nPatientQueryParams+4] = user.Name.FirstName
-					patientsQueryParams[i*nPatientQueryParams+5] = user.Name.LastName
-
-					fmt.Fprintf(insertPatientsAutomergeW, `(?,?,?,?),`)
-					hashName := sha256.New().Sum([]byte(user.Name.FirstName + user.Name.LastName + patient_dob))
-					hashEmail := sha256.New().Sum([]byte(patient_email + patient_dob))
-					automergeQueryParams[i*nAutomergeQueryParams+0] = currentPatient
-					automergeQueryParams[i*nAutomergeQueryParams+1] = patient_cid
-					automergeQueryParams[i*nAutomergeQueryParams+2] = hashName[:32]
-					automergeQueryParams[i*nAutomergeQueryParams+3] = hashEmail[:32]
-
-					lowerFirstNamePadded := strings.ToLower(user.Name.FirstName) + "        "
-					firstNameHmacSetBits, _ := getSearchData(lowerFirstNamePadded)
-					for _, bit := range firstNameHmacSetBits {
-						insertPatientsFnBidxW.WriteString(`(?,?,?),`)
-						fnQueryParams = append(fnQueryParams, currentPatient)
-						fnQueryParams = append(fnQueryParams, patient_cid)
-						fnQueryParams = append(fnQueryParams, bit)
-					}
-
-					lowerLastNamePadded := strings.ToLower(user.Name.LastName) + "        "
-					lastNameHmacSetBits, _ := getSearchData(lowerLastNamePadded)
-					for _, bit := range lastNameHmacSetBits {
-						insertPatientsLnBidxW.WriteString(`(?,?,?),`)
-						lnQueryParams = append(lnQueryParams, currentPatient)
-						lnQueryParams = append(lnQueryParams, patient_cid)
-						lnQueryParams = append(lnQueryParams, bit)
-					}
-
-					currentPatient++
+				if i < len(randomUsers)+startIndex {
+					_, _ = fmt.Fprint(f, ",\n")
 				}
-				patientsQuery := insertPatientsW.String()
-				patientsQuery = patientsQuery[0 : len(patientsQuery)-1]
-				returnBuilder(insertPatientsW)
-
-				patientsAutomergeQuery := insertPatientsAutomergeW.String()
-				patientsAutomergeQuery = patientsAutomergeQuery[0 : len(patientsAutomergeQuery)-1]
-				returnBuilder(insertPatientsAutomergeW)
-
-				patientsLnBidxQuery := insertPatientsLnBidxW.String()
-				patientsLnBidxQuery = patientsLnBidxQuery[0 : len(patientsLnBidxQuery)-1]
-				returnBuilder(insertPatientsLnBidxW)
-
-				patientsFnBidxQuery := insertPatientsFnBidxW.String()
-				patientsFnBidxQuery = patientsFnBidxQuery[0 : len(patientsFnBidxQuery)-1]
-				returnBuilder(insertPatientsFnBidxW)
-				go func() {
-					<-connlck
-					res, cerr := db.Exec(patientsQuery, patientsQueryParams...)
-					if cerr != nil {
-						panic(cerr)
-					}
-					row, _ := res.RowsAffected()
-					affectedCh <- row
-
-					_, cerr = db.Exec(patientsAutomergeQuery, automergeQueryParams...)
-					if cerr != nil {
-						panic(cerr)
-					}
-					// row, _ = res.RowsAffected()
-					// affectedCh <- row
-
-					_, cerr = db.Exec(patientsLnBidxQuery, lnQueryParams...)
-					if cerr != nil {
-						panic(cerr)
-					}
-					// row, _ = res.RowsAffected()
-					// affectedCh <- row
-
-					_, cerr = db.Exec(patientsFnBidxQuery, fnQueryParams...)
-					if cerr != nil {
-						panic(cerr)
-					}
-					// row, _ = res.RowsAffected()
-					// affectedCh <- row
-
-					wg.Done()
-					connlck <- 0
-					preplck <- 0
-				}()
 			}
-			wg.Wait()
-		}
-		close(affectedCh)
-		<-doneWithPopulateCh
-		fmt.Printf("affected %d rows\n", affectedRows)
+			log.Println("patient insert statements created")
+			_, _ = fmt.Fprint(f, ";\n")
+
+			_, _ = fmt.Fprint(f, `insert into patients_bidx (
+				cid,
+				pid,
+				lnidx,
+				fnidx
+				)
+				values `)
+			for i_pre_add, user := range randomUsers {
+				i := i_pre_add + startIndex + 1
+
+				patient_cid := (i % ncids) + 1 // n customers, spread the data out
+				lowerLastNamePadded := strings.ToLower(user.Name.LastName) + "        "
+				lowerFirstNamePadded := strings.ToLower(user.Name.FirstName) + "        "
+				fnhmac := getBidxHmac(lowerFirstNamePadded)
+				lnhmac := getBidxHmac(lowerLastNamePadded)
+				_, _ = fmt.Fprintf(f, `(%d,%d,%d,%d)`,
+					patient_cid,
+					i,
+					lnhmac,
+					fnhmac,
+				)
+				if i < len(randomUsers)+startIndex {
+					_, _ = fmt.Fprint(f, ",\n")
+				}
+			}
+			log.Println("patient_bidx insert statements created")
+			_, _ = fmt.Fprint(f, ";\n")
+
+			_, _ = fmt.Fprint(f, `insert into patients_bidx_split (
+				pid,
+				cid,
+				idx_fn_one,
+				idx_fn_two,
+				idx_fn_three,
+				idx_fn_four,
+				idx_fn_five,
+				idx_fn_six,
+				idx_ln_one,
+				idx_ln_two,
+				idx_ln_three,
+				idx_ln_four,
+				idx_ln_five,
+				idx_ln_six
+				)
+				values `)
+			for i_pre_add, user := range randomUsers {
+				i := i_pre_add + startIndex + 1
+
+				patient_cid := (i % ncids) + 1 // n customers, spread the data out
+				lowerLastNamePadded := strings.ToLower(user.Name.LastName) + "        "
+				lowerFirstNamePadded := strings.ToLower(user.Name.FirstName) + "        "
+				parts_fn_1 := zeroOrHmac(lowerFirstNamePadded, 1)
+				parts_fn_2 := zeroOrHmac(lowerFirstNamePadded, 2)
+				parts_fn_3 := zeroOrHmac(lowerFirstNamePadded, 3)
+				parts_fn_4 := zeroOrHmac(lowerFirstNamePadded, 4)
+				parts_fn_5 := zeroOrHmac(lowerFirstNamePadded, 5)
+				parts_fn_6 := zeroOrHmac(lowerFirstNamePadded, 6)
+				parts_ln_1 := zeroOrHmac(lowerLastNamePadded, 1)
+				parts_ln_2 := zeroOrHmac(lowerLastNamePadded, 2)
+				parts_ln_3 := zeroOrHmac(lowerLastNamePadded, 3)
+				parts_ln_4 := zeroOrHmac(lowerLastNamePadded, 4)
+				parts_ln_5 := zeroOrHmac(lowerLastNamePadded, 5)
+				parts_ln_6 := zeroOrHmac(lowerLastNamePadded, 6)
+				fnhmac_1 := combineHmacs(parts_fn_1, 0, 0, 0, 0, 0)
+				fnhmac_2 := combineHmacs(parts_fn_1, parts_fn_2, 0, 0, 0, 0)
+				fnhmac_3 := combineHmacs(parts_fn_1, parts_fn_2, parts_fn_3, 0, 0, 0)
+				fnhmac_4 := combineHmacs(parts_fn_1, parts_fn_2, parts_fn_3, parts_fn_4, 0, 0)
+				fnhmac_5 := combineHmacs(parts_fn_1, parts_fn_2, parts_fn_3, parts_fn_4, parts_fn_5, 0)
+				fnhmac_6 := combineHmacs(parts_fn_1, parts_fn_2, parts_fn_3, parts_fn_4, parts_fn_5, parts_fn_6)
+				lnhmac_1 := combineHmacs(parts_ln_1, 0, 0, 0, 0, 0)
+				lnhmac_2 := combineHmacs(parts_ln_1, parts_ln_2, 0, 0, 0, 0)
+				lnhmac_3 := combineHmacs(parts_ln_1, parts_ln_2, parts_ln_3, 0, 0, 0)
+				lnhmac_4 := combineHmacs(parts_ln_1, parts_ln_2, parts_ln_3, parts_ln_4, 0, 0)
+				lnhmac_5 := combineHmacs(parts_ln_1, parts_ln_2, parts_ln_3, parts_ln_4, parts_ln_5, 0)
+				lnhmac_6 := combineHmacs(parts_ln_1, parts_ln_2, parts_ln_3, parts_ln_4, parts_ln_5, parts_ln_6)
+				_, _ = fmt.Fprintf(f, `(%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d)`,
+					i,
+					patient_cid,
+					fnhmac_1,
+					fnhmac_2,
+					fnhmac_3,
+					fnhmac_4,
+					fnhmac_5,
+					fnhmac_6,
+					lnhmac_1,
+					lnhmac_2,
+					lnhmac_3,
+					lnhmac_4,
+					lnhmac_5,
+					lnhmac_6,
+				)
+				if i < len(randomUsers)+startIndex {
+					_, _ = fmt.Fprint(f, ",\n")
+				}
+			}
+			log.Println("patient_bidx_split insert statements created")
+			_, _ = fmt.Fprint(f, ";\n")
+
+			_, _ = fmt.Fprint(f, `insert into patients_bidx_split_unified (
+				pid,
+				cid,
+				idx_one,
+				idx_two,
+				idx_three,
+				idx_four,
+				idx_five,
+				idx_six
+				)
+				values `)
+			for i_pre_add, user := range randomUsers {
+				i := i_pre_add + startIndex + 1
+
+				patient_cid := (i % ncids) + 1 // n customers, spread the data out
+				lowerLastNamePadded := strings.ToLower(user.Name.LastName) + "        "
+				lowerFirstNamePadded := strings.ToLower(user.Name.FirstName) + "        "
+				parts_fn_1 := zeroOrHmac(lowerFirstNamePadded, 1)
+				parts_fn_2 := zeroOrHmac(lowerFirstNamePadded, 2)
+				parts_fn_3 := zeroOrHmac(lowerFirstNamePadded, 3)
+				parts_fn_4 := zeroOrHmac(lowerFirstNamePadded, 4)
+				parts_fn_5 := zeroOrHmac(lowerFirstNamePadded, 5)
+				parts_fn_6 := zeroOrHmac(lowerFirstNamePadded, 6)
+				parts_ln_1 := zeroOrHmac(lowerLastNamePadded, 1)
+				parts_ln_2 := zeroOrHmac(lowerLastNamePadded, 2)
+				parts_ln_3 := zeroOrHmac(lowerLastNamePadded, 3)
+				parts_ln_4 := zeroOrHmac(lowerLastNamePadded, 4)
+				parts_ln_5 := zeroOrHmac(lowerLastNamePadded, 5)
+				parts_ln_6 := zeroOrHmac(lowerLastNamePadded, 6)
+				fnhmac_1 := combineHmacs(parts_fn_1, 0, 0, 0, 0, 0)
+				fnhmac_2 := combineHmacs(parts_fn_1, parts_fn_2, 0, 0, 0, 0)
+				fnhmac_3 := combineHmacs(parts_fn_1, parts_fn_2, parts_fn_3, 0, 0, 0)
+				fnhmac_4 := combineHmacs(parts_fn_1, parts_fn_2, parts_fn_3, parts_fn_4, 0, 0)
+				fnhmac_5 := combineHmacs(parts_fn_1, parts_fn_2, parts_fn_3, parts_fn_4, parts_fn_5, 0)
+				fnhmac_6 := combineHmacs(parts_fn_1, parts_fn_2, parts_fn_3, parts_fn_4, parts_fn_5, parts_fn_6)
+				lnhmac_1 := combineHmacs(parts_ln_1, 0, 0, 0, 0, 0)
+				lnhmac_2 := combineHmacs(parts_ln_1, parts_ln_2, 0, 0, 0, 0)
+				lnhmac_3 := combineHmacs(parts_ln_1, parts_ln_2, parts_ln_3, 0, 0, 0)
+				lnhmac_4 := combineHmacs(parts_ln_1, parts_ln_2, parts_ln_3, parts_ln_4, 0, 0)
+				lnhmac_5 := combineHmacs(parts_ln_1, parts_ln_2, parts_ln_3, parts_ln_4, parts_ln_5, 0)
+				lnhmac_6 := combineHmacs(parts_ln_1, parts_ln_2, parts_ln_3, parts_ln_4, parts_ln_5, parts_ln_6)
+				_, _ = fmt.Fprintf(f, `(%d,%d,%d,%d,%d,%d,%d,%d),(%d,%d,%d,%d,%d,%d,%d,%d)`,
+					i,
+					patient_cid,
+					fnhmac_1,
+					fnhmac_2,
+					fnhmac_3,
+					fnhmac_4,
+					fnhmac_5,
+					fnhmac_6,
+					i,
+					patient_cid,
+					lnhmac_1,
+					lnhmac_2,
+					lnhmac_3,
+					lnhmac_4,
+					lnhmac_5,
+					lnhmac_6,
+				)
+				if i < len(randomUsers)+startIndex {
+					_, _ = fmt.Fprint(f, ",\n")
+				}
+			}
+			_, _ = fmt.Fprint(f, ";\n")
+			log.Println("patient_bidx_split_unified insert statements created")
+			_, _ = fmt.Fprint(f, `insert into patients_automerge ( pid, cid, automerge_full_name_dob, automerge_email_dob) values `)
+			for i_pre_add, user := range randomUsers {
+				i := i_pre_add + startIndex + 1
+				patient_cid := (i % ncids) + 1 // n customers, spread the data out
+				patient_email := fmt.Sprintf("%s.%s@mail.test", user.Name.FirstName, user.Name.LastName)
+				patient_dob := time.Now().UTC().Add(-time.Hour * 24 * time.Duration(i%365)).Format("2006-01-02")
+
+				hashName := sha256.New().Sum([]byte(user.Name.FirstName + user.Name.LastName + patient_dob))
+				hashEmail := sha256.New().Sum([]byte(patient_email + patient_dob))
+
+				_, _ = fmt.Fprintf(f, `(%d,%d,X'%s',X'%s')`, i, patient_cid, hex.EncodeToString(hashName[:32]), hex.EncodeToString(hashEmail[:32]))
+				if i < len(randomUsers)+startIndex {
+					_, _ = fmt.Fprint(f, ",\n")
+				}
+			}
+			log.Println("automerge insert statements created")
+			_, _ = fmt.Fprint(f, ";\n")
+			return nil
+		})
+
 	}
 }
